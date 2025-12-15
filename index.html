@@ -12,44 +12,40 @@
 </head>
 <body>
 <script>
-/*
-  Maze Quest Game (p5.js)
-  - Arrow keys / WASD move
-  - Collision with walls (no wall crossing)
-  - Timer + Score
-  - Start, Gameplay, Finish screens
-*/
-
 let state = "START"; // START, PLAY, WIN, LOSE
 let cellSize = 32;
-let cols = 19;   // odd numbers look nicer for mazes
+let cols = 19;
 let rows = 13;
 
-let maze;        // 2D grid: 0 = path, 1 = wall
+let maze;        // 0 = path, 1 = wall
 let player;
 let exitCell;
 
+let keyCell;
+let hasKey = false;
+
 let startTimeMs = 0;
-let timeLimitSec = 60;
+let timeLimitSec = 100; // 100 seconds to match score 100->0 nicely (you can change)
 let timeLeft = timeLimitSec;
 
-let score = 0;
-let moves = 0;        // optional: track movement count
-let moveCooldown = 0; // simple input smoothing
+let score = 100;
+
+const KEY_SAFE_DIST = 6; // manhattan distance away from exit (not "near")
 
 function setup() {
-  createCanvas(cols * cellSize, rows * cellSize + 70); // extra UI area
+  createCanvas(cols * cellSize, rows * cellSize + 70);
   textFont("Arial");
   resetGame();
 }
 
 function resetGame() {
   maze = generateMaze(cols, rows);
+
   // Ensure borders are walls
   for (let x = 0; x < cols; x++) { maze[0][x] = 1; maze[rows-1][x] = 1; }
   for (let y = 0; y < rows; y++) { maze[y][0] = 1; maze[y][cols-1] = 1; }
 
-  // Player start (find first open cell near top-left)
+  // Player start (open cell near top-left)
   const startCell = findOpenNear(1, 1);
   player = {
     r: cellSize * 0.33,
@@ -58,14 +54,16 @@ function resetGame() {
     speed: 3.0
   };
 
-  // Exit (find open cell near bottom-right)
+  // Exit (open cell near bottom-right)
   exitCell = findOpenNear(cols - 2, rows - 2);
 
-  timeLeft = timeLimitSec;
-  score = 0;
-  moves = 0;
-  moveCooldown = 0;
+  // Key (random open cell far from exit)
+  keyCell = spawnKeyCellFarFromExit();
 
+  hasKey = false;
+  score = 100;
+
+  timeLeft = timeLimitSec;
   startTimeMs = millis();
   state = "START";
 }
@@ -73,31 +71,25 @@ function resetGame() {
 function draw() {
   background(10, 16, 32);
 
-  // Game area
-  push();
-  translate(0, 0);
   drawMaze();
   drawExit();
+  drawKey();
   drawPlayer();
-  pop();
-
-  // UI area
   drawUI();
 
-  // State overlays
   if (state === "START") drawStartScreen();
   if (state === "WIN") drawFinishScreen(true);
   if (state === "LOSE") drawFinishScreen(false);
 
   if (state === "PLAY") {
-    updateTimer();
+    updateTimerAndScore();
     handleMovement();
+    checkPickKey();
     checkWinLose();
   }
 }
 
 function drawUI() {
-  // UI panel
   noStroke();
   fill(255, 255, 255, 10);
   rect(0, rows * cellSize, width, 70);
@@ -109,23 +101,22 @@ function drawUI() {
   const uiY = rows * cellSize + 35;
   text(`Time: ${nf(max(0, floor(timeLeft)), 2)}s`, 14, uiY);
   text(`Score: ${score}`, 140, uiY);
-  text(`Moves: ${moves}`, 260, uiY);
+
+  textAlign(LEFT, CENTER);
+  text(hasKey ? "Key: ✅" : "Key: ❌", 260, uiY);
 
   textAlign(RIGHT, CENTER);
   text(`R: Restart`, width - 14, uiY);
 }
 
 function drawMaze() {
-  // Walls as tiles
   for (let y = 0; y < rows; y++) {
     for (let x = 0; x < cols; x++) {
       if (maze[y][x] === 1) {
-        // Wall
         fill(40, 55, 95);
         stroke(255, 255, 255, 20);
         rect(x * cellSize, y * cellSize, cellSize, cellSize, 6);
       } else {
-        // Path
         noStroke();
         fill(255, 255, 255, 6);
         rect(x * cellSize, y * cellSize, cellSize, cellSize);
@@ -135,32 +126,63 @@ function drawMaze() {
 }
 
 function drawExit() {
-  // Exit highlight
   const ex = exitCell.x * cellSize;
   const ey = exitCell.y * cellSize;
 
   noStroke();
-  fill(80, 255, 170, 90);
-  rect(ex + 4, ey + 4, cellSize - 8, cellSize - 8, 10);
 
-  fill(80, 255, 170);
-  textSize(12);
-  textAlign(CENTER, CENTER);
-  text("EXIT", ex + cellSize/2, ey + cellSize/2);
+  if (hasKey) {
+    fill(80, 255, 170, 90);
+    rect(ex + 4, ey + 4, cellSize - 8, cellSize - 8, 10);
+    fill(80, 255, 170);
+    textSize(12);
+    textAlign(CENTER, CENTER);
+    text("EXIT", ex + cellSize/2, ey + cellSize/2);
+  } else {
+    // locked exit
+    fill(255, 120, 120, 80);
+    rect(ex + 4, ey + 4, cellSize - 8, cellSize - 8, 10);
+
+    fill(255, 120, 120);
+    textSize(12);
+    textAlign(CENTER, CENTER);
+    text("LOCK", ex + cellSize/2, ey + cellSize/2);
+
+    // small lock icon
+    stroke(255, 120, 120);
+    noFill();
+    rect(ex + cellSize*0.32, ey + cellSize*0.42, cellSize*0.36, cellSize*0.30, 4);
+    arc(ex + cellSize*0.50, ey + cellSize*0.42, cellSize*0.26, cellSize*0.22, PI, TWO_PI);
+  }
+}
+
+function drawKey() {
+  if (hasKey) return;
+
+  const kx = keyCell.x * cellSize + cellSize/2;
+  const ky = keyCell.y * cellSize + cellSize/2;
+
+  // simple "key" drawing
+  noStroke();
+  fill(255, 215, 90);
+  circle(kx - 6, ky, 12);
+  rect(kx - 2, ky - 3, 18, 6, 3);
+  rect(kx + 10, ky - 3, 4, 10, 2);
+  rect(kx + 16, ky - 3, 4, 6, 2);
+
+  fill(255, 215, 90, 60);
+  circle(kx, ky, 24);
 }
 
 function drawPlayer() {
   noStroke();
   fill(255, 215, 90);
   circle(player.x, player.y, player.r * 2);
-
-  // a tiny "eye" so it feels alive
   fill(30);
   circle(player.x + player.r * 0.35, player.y - player.r * 0.15, player.r * 0.35);
 }
 
 function drawStartScreen() {
-  // Dim overlay
   noStroke();
   fill(0, 0, 0, 160);
   rect(0, 0, width, height);
@@ -168,17 +190,13 @@ function drawStartScreen() {
   fill(255);
   textAlign(CENTER, CENTER);
   textSize(28);
-  text("MAZE QUEST", width/2, height/2 - 60);
+  text("MAZE QUEST", width/2, height/2 - 70);
 
   textSize(14);
-  text("Find the EXIT before time runs out.", width/2, height/2 - 20);
-  text("Arrow Keys / WASD to move. You cannot cross walls.", width/2, height/2 + 5);
-  text("Press SPACE to start.", width/2, height/2 + 35);
-
-  // little hint at bottom
-  textSize(12);
-  fill(255, 255, 255, 200);
-  text("Tip: Score = time left bonus. Finish faster! ⚡", width/2, height - 20);
+  text("Goal: Get the key, then reach the EXIT.", width/2, height/2 - 30);
+  text("Score starts at 100 and drops 1 per second.", width/2, height/2 - 10);
+  text("Arrow Keys / WASD to move. Walls block you.", width/2, height/2 + 10);
+  text("Press SPACE to start.", width/2, height/2 + 40);
 }
 
 function drawFinishScreen(isWin) {
@@ -193,10 +211,9 @@ function drawFinishScreen(isWin) {
 
   textSize(14);
   text(`Final Score: ${score}`, width/2, height/2 - 18);
-  text(`Moves: ${moves}`, width/2, height/2 + 6);
 
   textSize(13);
-  text("Press R to restart.", width/2, height/2 + 40);
+  text("Press R to restart.", width/2, height/2 + 35);
 }
 
 function keyPressed() {
@@ -204,43 +221,41 @@ function keyPressed() {
     resetGame();
     return;
   }
-
   if (state === "START" && keyCode === 32) { // SPACE
     state = "PLAY";
     startTimeMs = millis();
   }
 }
 
-function updateTimer() {
-  const elapsed = (millis() - startTimeMs) / 1000.0;
-  timeLeft = timeLimitSec - elapsed;
-  if (timeLeft <= 0) {
+function updateTimerAndScore() {
+  const elapsedSec = (millis() - startTimeMs) / 1000.0;
+  timeLeft = timeLimitSec - elapsedSec;
+
+  // score: start 100, minus 1 per second
+  score = max(0, 100 - floor(elapsedSec));
+
+  if (timeLeft <= 0 || score <= 0) {
     timeLeft = 0;
+    score = 0;
     state = "LOSE";
   }
 }
 
 function handleMovement() {
-  if (moveCooldown > 0) moveCooldown--;
-
   let dx = 0, dy = 0;
   const sp = player.speed;
 
-  // allow smooth movement using held keys
-  if (keyIsDown(LEFT_ARROW) || keyIsDown(65)) dx -= sp;  // A
-  if (keyIsDown(RIGHT_ARROW) || keyIsDown(68)) dx += sp; // D
-  if (keyIsDown(UP_ARROW) || keyIsDown(87)) dy -= sp;    // W
-  if (keyIsDown(DOWN_ARROW) || keyIsDown(83)) dy += sp;  // S
+  if (keyIsDown(LEFT_ARROW) || keyIsDown(65)) dx -= sp;
+  if (keyIsDown(RIGHT_ARROW) || keyIsDown(68)) dx += sp;
+  if (keyIsDown(UP_ARROW) || keyIsDown(87)) dy -= sp;
+  if (keyIsDown(DOWN_ARROW) || keyIsDown(83)) dy += sp;
 
   if (dx !== 0 || dy !== 0) {
-    // normalize diagonal a bit
     const mag = Math.hypot(dx, dy);
     if (mag > sp) {
       dx = dx / mag * sp;
       dy = dy / mag * sp;
     }
-
-    // Attempt move with collision
     tryMove(dx, dy);
   }
 }
@@ -249,19 +264,11 @@ function tryMove(dx, dy) {
   const newX = player.x + dx;
   const newY = player.y + dy;
 
-  // collision test against walls (circle vs tile)
-  if (!collidesWithWall(newX, player.y, player.r)) {
-    if (dx !== 0) moves++;
-    player.x = newX;
-  }
-  if (!collidesWithWall(player.x, newY, player.r)) {
-    if (dy !== 0) moves++;
-    player.y = newY;
-  }
+  if (!collidesWithWall(newX, player.y, player.r)) player.x = newX;
+  if (!collidesWithWall(player.x, newY, player.r)) player.y = newY;
 }
 
 function collidesWithWall(cx, cy, r) {
-  // Check nearby tiles only
   const minX = floor((cx - r) / cellSize);
   const maxX = floor((cx + r) / cellSize);
   const minY = floor((cy - r) / cellSize);
@@ -271,7 +278,6 @@ function collidesWithWall(cx, cy, r) {
     for (let x = minX; x <= maxX; x++) {
       if (x < 0 || y < 0 || x >= cols || y >= rows) return true;
       if (maze[y][x] === 1) {
-        // circle-rect collision
         const rx = x * cellSize;
         const ry = y * cellSize;
         const closestX = constrain(cx, rx, rx + cellSize);
@@ -284,30 +290,83 @@ function collidesWithWall(cx, cy, r) {
   return false;
 }
 
-function checkWinLose() {
-  if (state !== "PLAY") return;
+function checkPickKey() {
+  if (hasKey) return;
 
-  // Win if player center enters exit tile
   const px = floor(player.x / cellSize);
   const py = floor(player.y / cellSize);
 
-  if (px === exitCell.x && py === exitCell.y) {
-    // Score: remaining time * 10, plus tiny efficiency bonus
-    score = floor(timeLeft * 10) + max(0, 500 - moves);
+  if (px === keyCell.x && py === keyCell.y) {
+    hasKey = true;
+  }
+}
+
+function checkWinLose() {
+  if (state !== "PLAY") return;
+
+  const px = floor(player.x / cellSize);
+  const py = floor(player.y / cellSize);
+
+  // Must have key AND be on exit tile
+  if (hasKey && px === exitCell.x && py === exitCell.y) {
     state = "WIN";
   }
 }
 
-/* =========================
-   Maze generation (simple)
-   - Randomized DFS carving on odd grid
-   - Returns 2D array [rows][cols]
-========================= */
+/* ===== Key spawn: far from exit ===== */
+function spawnKeyCellFarFromExit() {
+  // collect all open cells that satisfy distance rule
+  let candidates = [];
+  for (let y = 1; y < rows - 1; y++) {
+    for (let x = 1; x < cols - 1; x++) {
+      if (maze[y][x] === 0) {
+        const d = manhattan(x, y, exitCell.x, exitCell.y);
+        // also avoid spawning on exit itself
+        if (d >= KEY_SAFE_DIST && !(x === exitCell.x && y === exitCell.y)) {
+          candidates.push({x, y});
+        }
+      }
+    }
+  }
+
+  // if maze is tiny or unlucky, relax rule gradually
+  let dist = KEY_SAFE_DIST;
+  while (candidates.length === 0 && dist > 2) {
+    dist--;
+    for (let y = 1; y < rows - 1; y++) {
+      for (let x = 1; x < cols - 1; x++) {
+        if (maze[y][x] === 0) {
+          const d = manhattan(x, y, exitCell.x, exitCell.y);
+          if (d >= dist && !(x === exitCell.x && y === exitCell.y)) {
+            candidates.push({x, y});
+          }
+        }
+      }
+    }
+  }
+
+  // final fallback: any open cell not on exit
+  if (candidates.length === 0) {
+    for (let y = 1; y < rows - 1; y++) {
+      for (let x = 1; x < cols - 1; x++) {
+        if (maze[y][x] === 0 && !(x === exitCell.x && y === exitCell.y)) {
+          candidates.push({x, y});
+        }
+      }
+    }
+  }
+
+  return random(candidates);
+}
+
+function manhattan(x1, y1, x2, y2) {
+  return abs(x1 - x2) + abs(y1 - y2);
+}
+
+/* ===== Maze generation (DFS carve) ===== */
 function generateMaze(w, h) {
-  // start full of walls
   let grid = Array.from({length: h}, () => Array.from({length: w}, () => 1));
 
-  // carve cells at odd coordinates
   function neighbors(cx, cy) {
     const dirs = [
       {dx: 2, dy: 0},
@@ -322,7 +381,6 @@ function generateMaze(w, h) {
         list.push({nx, ny, wx: cx + d.dx/2, wy: cy + d.dy/2});
       }
     }
-    // shuffle
     for (let i = list.length - 1; i > 0; i--) {
       const j = floor(random(i + 1));
       [list[i], list[j]] = [list[j], list[i]];
@@ -330,7 +388,6 @@ function generateMaze(w, h) {
     return list;
   }
 
-  // pick start odd cell
   let stack = [];
   let sx = 1, sy = 1;
   grid[sy][sx] = 0;
@@ -344,14 +401,13 @@ function generateMaze(w, h) {
       stack.pop();
     } else {
       const pick = opts[0];
-      // carve wall between + target
       grid[pick.wy][pick.wx] = 0;
       grid[pick.ny][pick.nx] = 0;
       stack.push({x: pick.nx, y: pick.ny});
     }
   }
 
-  // punch a few extra holes to reduce dead-ends (optional)
+  // punch a few extra holes (makes it less corridor-ish)
   for (let k = 0; k < 18; k++) {
     const x = floor(random(1, w-1));
     const y = floor(random(1, h-1));
@@ -374,7 +430,6 @@ function countOpenNeighbors(grid, x, y) {
 }
 
 function findOpenNear(tx, ty) {
-  // spiral-ish search for nearest open cell
   for (let r = 0; r < max(cols, rows); r++) {
     for (let y = ty - r; y <= ty + r; y++) {
       for (let x = tx - r; x <= tx + r; x++) {
@@ -384,7 +439,6 @@ function findOpenNear(tx, ty) {
       }
     }
   }
-  // fallback
   return {x: 1, y: 1};
 }
 </script>
