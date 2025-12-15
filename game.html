@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Maze Quest Game (p5.js)</title>
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
+  <style>
+    body { margin:0; background:#0b1020; display:flex; justify-content:center; align-items:center; height:100vh; }
+    canvas { border-radius:16px; box-shadow:0 12px 40px rgba(0,0,0,.35); }
+  </style>
+</head>
+<body>
+<script>
+/*
+  Maze Quest Game (p5.js)
+  - Arrow keys / WASD move
+  - Collision with walls (no wall crossing)
+  - Timer + Score
+  - Start, Gameplay, Finish screens
+*/
+
+let state = "START"; // START, PLAY, WIN, LOSE
+let cellSize = 32;
+let cols = 19;   // odd numbers look nicer for mazes
+let rows = 13;
+
+let maze;        // 2D grid: 0 = path, 1 = wall
+let player;
+let exitCell;
+
+let startTimeMs = 0;
+let timeLimitSec = 60;
+let timeLeft = timeLimitSec;
+
+let score = 0;
+let moves = 0;        // optional: track movement count
+let moveCooldown = 0; // simple input smoothing
+
+function setup() {
+  createCanvas(cols * cellSize, rows * cellSize + 70); // extra UI area
+  textFont("Arial");
+  resetGame();
+}
+
+function resetGame() {
+  maze = generateMaze(cols, rows);
+  // Ensure borders are walls
+  for (let x = 0; x < cols; x++) { maze[0][x] = 1; maze[rows-1][x] = 1; }
+  for (let y = 0; y < rows; y++) { maze[y][0] = 1; maze[y][cols-1] = 1; }
+
+  // Player start (find first open cell near top-left)
+  const startCell = findOpenNear(1, 1);
+  player = {
+    r: cellSize * 0.33,
+    x: (startCell.x + 0.5) * cellSize,
+    y: (startCell.y + 0.5) * cellSize,
+    speed: 3.0
+  };
+
+  // Exit (find open cell near bottom-right)
+  exitCell = findOpenNear(cols - 2, rows - 2);
+
+  timeLeft = timeLimitSec;
+  score = 0;
+  moves = 0;
+  moveCooldown = 0;
+
+  startTimeMs = millis();
+  state = "START";
+}
+
+function draw() {
+  background(10, 16, 32);
+
+  // Game area
+  push();
+  translate(0, 0);
+  drawMaze();
+  drawExit();
+  drawPlayer();
+  pop();
+
+  // UI area
+  drawUI();
+
+  // State overlays
+  if (state === "START") drawStartScreen();
+  if (state === "WIN") drawFinishScreen(true);
+  if (state === "LOSE") drawFinishScreen(false);
+
+  if (state === "PLAY") {
+    updateTimer();
+    handleMovement();
+    checkWinLose();
+  }
+}
+
+function drawUI() {
+  // UI panel
+  noStroke();
+  fill(255, 255, 255, 10);
+  rect(0, rows * cellSize, width, 70);
+
+  fill(240);
+  textSize(16);
+  textAlign(LEFT, CENTER);
+
+  const uiY = rows * cellSize + 35;
+  text(`Time: ${nf(max(0, floor(timeLeft)), 2)}s`, 14, uiY);
+  text(`Score: ${score}`, 140, uiY);
+  text(`Moves: ${moves}`, 260, uiY);
+
+  textAlign(RIGHT, CENTER);
+  text(`R: Restart`, width - 14, uiY);
+}
+
+function drawMaze() {
+  // Walls as tiles
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      if (maze[y][x] === 1) {
+        // Wall
+        fill(40, 55, 95);
+        stroke(255, 255, 255, 20);
+        rect(x * cellSize, y * cellSize, cellSize, cellSize, 6);
+      } else {
+        // Path
+        noStroke();
+        fill(255, 255, 255, 6);
+        rect(x * cellSize, y * cellSize, cellSize, cellSize);
+      }
+    }
+  }
+}
+
+function drawExit() {
+  // Exit highlight
+  const ex = exitCell.x * cellSize;
+  const ey = exitCell.y * cellSize;
+
+  noStroke();
+  fill(80, 255, 170, 90);
+  rect(ex + 4, ey + 4, cellSize - 8, cellSize - 8, 10);
+
+  fill(80, 255, 170);
+  textSize(12);
+  textAlign(CENTER, CENTER);
+  text("EXIT", ex + cellSize/2, ey + cellSize/2);
+}
+
+function drawPlayer() {
+  noStroke();
+  fill(255, 215, 90);
+  circle(player.x, player.y, player.r * 2);
+
+  // a tiny "eye" so it feels alive
+  fill(30);
+  circle(player.x + player.r * 0.35, player.y - player.r * 0.15, player.r * 0.35);
+}
+
+function drawStartScreen() {
+  // Dim overlay
+  noStroke();
+  fill(0, 0, 0, 160);
+  rect(0, 0, width, height);
+
+  fill(255);
+  textAlign(CENTER, CENTER);
+  textSize(28);
+  text("MAZE QUEST", width/2, height/2 - 60);
+
+  textSize(14);
+  text("Find the EXIT before time runs out.", width/2, height/2 - 20);
+  text("Arrow Keys / WASD to move. You cannot cross walls.", width/2, height/2 + 5);
+  text("Press SPACE to start.", width/2, height/2 + 35);
+
+  // little hint at bottom
+  textSize(12);
+  fill(255, 255, 255, 200);
+  text("Tip: Score = time left bonus. Finish faster! ⚡", width/2, height - 20);
+}
+
+function drawFinishScreen(isWin) {
+  noStroke();
+  fill(0, 0, 0, 170);
+  rect(0, 0, width, height);
+
+  textAlign(CENTER, CENTER);
+  textSize(26);
+  fill(255);
+  text(isWin ? "YOU ESCAPED ✅" : "TIME UP ⏳", width/2, height/2 - 60);
+
+  textSize(14);
+  text(`Final Score: ${score}`, width/2, height/2 - 18);
+  text(`Moves: ${moves}`, width/2, height/2 + 6);
+
+  textSize(13);
+  text("Press R to restart.", width/2, height/2 + 40);
+}
+
+function keyPressed() {
+  if (key === 'r' || key === 'R') {
+    resetGame();
+    return;
+  }
+
+  if (state === "START" && keyCode === 32) { // SPACE
+    state = "PLAY";
+    startTimeMs = millis();
+  }
+}
+
+function updateTimer() {
+  const elapsed = (millis() - startTimeMs) / 1000.0;
+  timeLeft = timeLimitSec - elapsed;
+  if (timeLeft <= 0) {
+    timeLeft = 0;
+    state = "LOSE";
+  }
+}
+
+function handleMovement() {
+  if (moveCooldown > 0) moveCooldown--;
+
+  let dx = 0, dy = 0;
+  const sp = player.speed;
+
+  // allow smooth movement using held keys
+  if (keyIsDown(LEFT_ARROW) || keyIsDown(65)) dx -= sp;  // A
+  if (keyIsDown(RIGHT_ARROW) || keyIsDown(68)) dx += sp; // D
+  if (keyIsDown(UP_ARROW) || keyIsDown(87)) dy -= sp;    // W
+  if (keyIsDown(DOWN_ARROW) || keyIsDown(83)) dy += sp;  // S
+
+  if (dx !== 0 || dy !== 0) {
+    // normalize diagonal a bit
+    const mag = Math.hypot(dx, dy);
+    if (mag > sp) {
+      dx = dx / mag * sp;
+      dy = dy / mag * sp;
+    }
+
+    // Attempt move with collision
+    tryMove(dx, dy);
+  }
+}
+
+function tryMove(dx, dy) {
+  const newX = player.x + dx;
+  const newY = player.y + dy;
+
+  // collision test against walls (circle vs tile)
+  if (!collidesWithWall(newX, player.y, player.r)) {
+    if (dx !== 0) moves++;
+    player.x = newX;
+  }
+  if (!collidesWithWall(player.x, newY, player.r)) {
+    if (dy !== 0) moves++;
+    player.y = newY;
+  }
+}
+
+function collidesWithWall(cx, cy, r) {
+  // Check nearby tiles only
+  const minX = floor((cx - r) / cellSize);
+  const maxX = floor((cx + r) / cellSize);
+  const minY = floor((cy - r) / cellSize);
+  const maxY = floor((cy + r) / cellSize);
+
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      if (x < 0 || y < 0 || x >= cols || y >= rows) return true;
+      if (maze[y][x] === 1) {
+        // circle-rect collision
+        const rx = x * cellSize;
+        const ry = y * cellSize;
+        const closestX = constrain(cx, rx, rx + cellSize);
+        const closestY = constrain(cy, ry, ry + cellSize);
+        const distSq = (cx - closestX) ** 2 + (cy - closestY) ** 2;
+        if (distSq < r * r) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function checkWinLose() {
+  if (state !== "PLAY") return;
+
+  // Win if player center enters exit tile
+  const px = floor(player.x / cellSize);
+  const py = floor(player.y / cellSize);
+
+  if (px === exitCell.x && py === exitCell.y) {
+    // Score: remaining time * 10, plus tiny efficiency bonus
+    score = floor(timeLeft * 10) + max(0, 500 - moves);
+    state = "WIN";
+  }
+}
+
+/* =========================
+   Maze generation (simple)
+   - Randomized DFS carving on odd grid
+   - Returns 2D array [rows][cols]
+========================= */
+function generateMaze(w, h) {
+  // start full of walls
+  let grid = Array.from({length: h}, () => Array.from({length: w}, () => 1));
+
+  // carve cells at odd coordinates
+  function neighbors(cx, cy) {
+    const dirs = [
+      {dx: 2, dy: 0},
+      {dx: -2, dy: 0},
+      {dx: 0, dy: 2},
+      {dx: 0, dy: -2},
+    ];
+    let list = [];
+    for (const d of dirs) {
+      const nx = cx + d.dx, ny = cy + d.dy;
+      if (nx > 0 && ny > 0 && nx < w - 1 && ny < h - 1) {
+        list.push({nx, ny, wx: cx + d.dx/2, wy: cy + d.dy/2});
+      }
+    }
+    // shuffle
+    for (let i = list.length - 1; i > 0; i--) {
+      const j = floor(random(i + 1));
+      [list[i], list[j]] = [list[j], list[i]];
+    }
+    return list;
+  }
+
+  // pick start odd cell
+  let stack = [];
+  let sx = 1, sy = 1;
+  grid[sy][sx] = 0;
+  stack.push({x:sx, y:sy});
+
+  while (stack.length > 0) {
+    const cur = stack[stack.length - 1];
+    const opts = neighbors(cur.x, cur.y).filter(n => grid[n.ny][n.nx] === 1);
+
+    if (opts.length === 0) {
+      stack.pop();
+    } else {
+      const pick = opts[0];
+      // carve wall between + target
+      grid[pick.wy][pick.wx] = 0;
+      grid[pick.ny][pick.nx] = 0;
+      stack.push({x: pick.nx, y: pick.ny});
+    }
+  }
+
+  // punch a few extra holes to reduce dead-ends (optional)
+  for (let k = 0; k < 18; k++) {
+    const x = floor(random(1, w-1));
+    const y = floor(random(1, h-1));
+    if (grid[y][x] === 1 && countOpenNeighbors(grid, x, y) >= 2) {
+      grid[y][x] = 0;
+    }
+  }
+
+  return grid;
+}
+
+function countOpenNeighbors(grid, x, y) {
+  const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+  let c = 0;
+  for (const [dx,dy] of dirs) {
+    const nx = x+dx, ny = y+dy;
+    if (ny>=0 && ny<rows && nx>=0 && nx<cols && grid[ny][nx]===0) c++;
+  }
+  return c;
+}
+
+function findOpenNear(tx, ty) {
+  // spiral-ish search for nearest open cell
+  for (let r = 0; r < max(cols, rows); r++) {
+    for (let y = ty - r; y <= ty + r; y++) {
+      for (let x = tx - r; x <= tx + r; x++) {
+        if (x >= 1 && y >= 1 && x <= cols-2 && y <= rows-2) {
+          if (maze[y][x] === 0) return {x, y};
+        }
+      }
+    }
+  }
+  // fallback
+  return {x: 1, y: 1};
+}
+</script>
+</body>
+</html>
