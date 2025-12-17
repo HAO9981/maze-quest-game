@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Maze Quest Game (p5.js)</title>
+  <title>Maze Quest Game (p5.js) - 3 Gates in Front + No Forced-Death Start</title>
   <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
   <style>
     body { margin:0; background:#0b1020; display:flex; justify-content:center; align-items:center; height:100vh; }
@@ -12,434 +12,818 @@
 </head>
 <body>
 <script>
-let state = "START"; // START, PLAY, WIN, LOSE
-let cellSize = 32;
-let cols = 19;
-let rows = 13;
+/* =========================
+   HARD MODE
+   - Monster chases immediately
+   - Lose if caught
+   - Score: 100 - 1/sec
 
-let maze;        // 0 = path, 1 = wall
-let player;
+   FIX 1: 3 gates MUST be directly in front of exit (in a line).
+   - Force-carve an "exit hallway": Exit + Gate1 + Gate2 + Gate3
+   - Gate1 is adjacent to Exit
+
+   FIX 2: No forced-death start
+   - Player MUST spawn at a junction (degree >= 3)
+   - Monster spawn must satisfy:
+     from player junction, monster approaches via one exit,
+     and there exists at least one OTHER escape branch with length >= MIN_ESCAPE_BRANCH_LEN
+========================= */
+
+let state = "START";
+
+// Maze size (odd)
+let cols = 31;
+let rows = 21;
+let cellSize = 26;
+
+let maze; // 0 path, 1 wall
+
+let player, monster;
 let exitCell;
 
-let keyCell;
-let hasKey = false;
+const KEY_COUNT = 3;
+let keys = [];   // {x,y,id,collected}
+let gates = [];  // {x,y,id,open}
+let keysCollected = 0;
 
+let monsterPath = [];
+let monsterRepathCooldown = 0;
+
+// Time + Score
 let startTimeMs = 0;
-let timeLimitSec = 100; // 100 seconds to match score 100->0 nicely (you can change)
+let timeLimitSec = 160;
 let timeLeft = timeLimitSec;
+let scoreStart = 100;
+let score = scoreStart;
 
-let score = 100;
+// Difficulty knobs
+const BRAID_PROB = 0.18;
+const EXTRA_HOLES = 18;
 
-const KEY_SAFE_DIST = 6; // manhattan distance away from exit (not "near")
+// Spawn constraints
+const KEY_SAFE_DIST_EXIT = 10;
+const KEY_SAFE_DIST_PLAYER = 8;
+
+// Fairness knobs (this prevents “开局必死”)
+const MIN_MONSTER_DIST = 14;        // monster at least this BFS steps away
+const MIN_ESCAPE_BRANCH_LEN = 12;   // at start junction, at least one non-monster branch has this length
 
 function setup() {
-  createCanvas(cols * cellSize, rows * cellSize + 70);
+  createCanvas(cols * cellSize, rows * cellSize + 80);
   textFont("Arial");
   resetGame();
 }
 
 function resetGame() {
-  maze = generateMaze(cols, rows);
+  const MAX_TRIES = 260;
+  let ok = false;
 
-  // Ensure borders are walls
-  for (let x = 0; x < cols; x++) { maze[0][x] = 1; maze[rows-1][x] = 1; }
-  for (let y = 0; y < rows; y++) { maze[y][0] = 1; maze[y][cols-1] = 1; }
+  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+    maze = generateMazePrim(cols, rows);
+    // borders
+    for (let x=0;x<cols;x++){ maze[0][x]=1; maze[rows-1][x]=1; }
+    for (let y=0;y<rows;y++){ maze[y][0]=1; maze[y][cols-1]=1; }
 
-  // Player start (open cell near top-left)
-  const startCell = findOpenNear(1, 1);
-  player = {
-    r: cellSize * 0.33,
-    x: (startCell.x + 0.5) * cellSize,
-    y: (startCell.y + 0.5) * cellSize,
-    speed: 3.0
-  };
+    braidMaze(maze, BRAID_PROB);
+    punchExtraHoles(maze, EXTRA_HOLES);
 
-  // Exit (open cell near bottom-right)
-  exitCell = findOpenNear(cols - 2, rows - 2);
+    // Place exit first (near bottom-right but must be path)
+    exitCell = findOpenNear(cols-2, rows-2);
 
-  // Key (random open cell far from exit)
-  keyCell = spawnKeyCellFarFromExit();
+    // Force the 3 gates directly in front of exit
+    const forced = forceExitHallway(exitCell);
+    if (!forced) continue;
 
-  hasKey = false;
-  score = 100;
+    gates = forced.gates.map((c,i)=>({x:c.x,y:c.y,id:i+1,open:false}));
+
+    // Pick player start: MUST be junction (degree>=3)
+    const startCell = pickStartJunction();
+    if (!startCell) continue;
+
+    // Place 3 keys far from exit + far from start + not on gates/hallway
+    keys = placeMultipleKeys(startCell, exitCell, gates, KEY_COUNT);
+    if (!keys) continue;
+
+    // Spawn monster: must be far AND must not create forced-death at start junction
+    const monsterCell = spawnMonsterFairFromStartJunction(startCell);
+    if (!monsterCell) continue;
+
+    // Commit entities
+    player = {
+      r: cellSize*0.30,
+      x: (startCell.x+0.5)*cellSize,
+      y: (startCell.y+0.5)*cellSize,
+      speed: 3.1
+    };
+    monster = {
+      r: cellSize*0.29,
+      x: (monsterCell.x+0.5)*cellSize,
+      y: (monsterCell.y+0.5)*cellSize,
+      speed: 2.65
+    };
+
+    ok = true;
+    break;
+  }
+
+  if (!ok) {
+    // fallback (rare)
+    const startCell = {x:1,y:1};
+    player = { r: cellSize*0.30, x:(startCell.x+0.5)*cellSize, y:(startCell.y+0.5)*cellSize, speed:3.1 };
+    exitCell = {x:cols-2,y:rows-2};
+    gates = [{x:cols-3,y:rows-2,id:1,open:false},{x:cols-4,y:rows-2,id:2,open:false},{x:cols-5,y:rows-2,id:3,open:false}];
+    keys = [{x:3,y:3,id:1,collected:false},{x:7,y:7,id:2,collected:false},{x:5,y:9,id:3,collected:false}];
+    monster = { r: cellSize*0.29, x:(cols-2+0.5)*cellSize, y:(1+0.5)*cellSize, speed:2.65 };
+  }
+
+  keysCollected = 0;
+  for (const k of keys) k.collected = false;
+  for (const g of gates) g.open = false;
+
+  monsterPath = [];
+  monsterRepathCooldown = 0;
 
   timeLeft = timeLimitSec;
+  score = scoreStart;
   startTimeMs = millis();
   state = "START";
 }
 
 function draw() {
-  background(10, 16, 32);
+  background(10,16,32);
 
   drawMaze();
+  drawGates();
   drawExit();
-  drawKey();
+  drawKeys();
+  drawMonster();
   drawPlayer();
   drawUI();
 
-  if (state === "START") drawStartScreen();
-  if (state === "WIN") drawFinishScreen(true);
-  if (state === "LOSE") drawFinishScreen(false);
+  if (state==="START") drawStartScreen();
+  if (state==="WIN") drawFinishScreen(true);
+  if (state==="LOSE") drawFinishScreen(false);
 
-  if (state === "PLAY") {
+  if (state==="PLAY") {
     updateTimerAndScore();
     handleMovement();
-    checkPickKey();
-    checkWinLose();
+
+    updateMonsterChase();
+    checkMonsterCatchLose();
+
+    checkPickKeys();
+    updateGatesFromKeys();
+    checkWin();
   }
 }
 
-function drawUI() {
+/* ================= UI ================= */
+function drawUI(){
   noStroke();
-  fill(255, 255, 255, 10);
-  rect(0, rows * cellSize, width, 70);
+  fill(255,255,255,10);
+  rect(0, rows*cellSize, width, 80);
 
+  const uiY = rows*cellSize + 22;
   fill(240);
   textSize(16);
-  textAlign(LEFT, CENTER);
+  textAlign(LEFT,CENTER);
+  text(`Time: ${nf(max(0,floor(timeLeft)),3)}s`, 14, uiY);
+  text(`Score: ${score}`, 160, uiY);
+  text(`Keys: ${keysCollected}/${KEY_COUNT}`, 290, uiY);
 
-  const uiY = rows * cellSize + 35;
-  text(`Time: ${nf(max(0, floor(timeLeft)), 2)}s`, 14, uiY);
-  text(`Score: ${score}`, 140, uiY);
+  textSize(12);
+  fill(255,255,255,210);
+  text("3 light walls block the exit directly. Start is always a junction (no forced-death).", 14, uiY+26);
 
-  textAlign(LEFT, CENTER);
-  text(hasKey ? "Key: ✅" : "Key: ❌", 260, uiY);
-
-  textAlign(RIGHT, CENTER);
-  text(`R: Restart`, width - 14, uiY);
+  textAlign(RIGHT,CENTER);
+  textSize(14);
+  fill(240);
+  text(`SPACE: Start   R: Restart`, width-14, uiY);
 }
 
-function drawMaze() {
-  for (let y = 0; y < rows; y++) {
-    for (let x = 0; x < cols; x++) {
-      if (maze[y][x] === 1) {
-        fill(40, 55, 95);
-        stroke(255, 255, 255, 20);
-        rect(x * cellSize, y * cellSize, cellSize, cellSize, 6);
-      } else {
-        noStroke();
-        fill(255, 255, 255, 6);
-        rect(x * cellSize, y * cellSize, cellSize, cellSize);
-      }
-    }
-  }
-}
-
-function drawExit() {
-  const ex = exitCell.x * cellSize;
-  const ey = exitCell.y * cellSize;
-
+function drawStartScreen(){
   noStroke();
-
-  if (hasKey) {
-    fill(80, 255, 170, 90);
-    rect(ex + 4, ey + 4, cellSize - 8, cellSize - 8, 10);
-    fill(80, 255, 170);
-    textSize(12);
-    textAlign(CENTER, CENTER);
-    text("EXIT", ex + cellSize/2, ey + cellSize/2);
-  } else {
-    // locked exit
-    fill(255, 120, 120, 80);
-    rect(ex + 4, ey + 4, cellSize - 8, cellSize - 8, 10);
-
-    fill(255, 120, 120);
-    textSize(12);
-    textAlign(CENTER, CENTER);
-    text("LOCK", ex + cellSize/2, ey + cellSize/2);
-
-    // small lock icon
-    stroke(255, 120, 120);
-    noFill();
-    rect(ex + cellSize*0.32, ey + cellSize*0.42, cellSize*0.36, cellSize*0.30, 4);
-    arc(ex + cellSize*0.50, ey + cellSize*0.42, cellSize*0.26, cellSize*0.22, PI, TWO_PI);
-  }
-}
-
-function drawKey() {
-  if (hasKey) return;
-
-  const kx = keyCell.x * cellSize + cellSize/2;
-  const ky = keyCell.y * cellSize + cellSize/2;
-
-  // simple "key" drawing
-  noStroke();
-  fill(255, 215, 90);
-  circle(kx - 6, ky, 12);
-  rect(kx - 2, ky - 3, 18, 6, 3);
-  rect(kx + 10, ky - 3, 4, 10, 2);
-  rect(kx + 16, ky - 3, 4, 6, 2);
-
-  fill(255, 215, 90, 60);
-  circle(kx, ky, 24);
-}
-
-function drawPlayer() {
-  noStroke();
-  fill(255, 215, 90);
-  circle(player.x, player.y, player.r * 2);
-  fill(30);
-  circle(player.x + player.r * 0.35, player.y - player.r * 0.15, player.r * 0.35);
-}
-
-function drawStartScreen() {
-  noStroke();
-  fill(0, 0, 0, 160);
-  rect(0, 0, width, height);
+  fill(0,0,0,165);
+  rect(0,0,width,height);
 
   fill(255);
-  textAlign(CENTER, CENTER);
-  textSize(28);
-  text("MAZE QUEST", width/2, height/2 - 70);
+  textAlign(CENTER,CENTER);
+  textSize(24);
+  text("MAZE QUEST - 3 GATES IN FRONT", width/2, height/2-70);
 
   textSize(14);
-  text("Goal: Get the key, then reach the EXIT.", width/2, height/2 - 30);
-  text("Score starts at 100 and drops 1 per second.", width/2, height/2 - 10);
-  text("Arrow Keys / WASD to move. Walls block you.", width/2, height/2 + 10);
-  text("Press SPACE to start.", width/2, height/2 + 40);
+  text("Monster chases immediately. If it catches you: LOSE.", width/2, height/2-30);
+  text("Collect 3 keys to break 3 light walls blocking the exit.", width/2, height/2-10);
+  text("Press SPACE to start.", width/2, height/2+45);
 }
 
-function drawFinishScreen(isWin) {
+function drawFinishScreen(isWin){
   noStroke();
-  fill(0, 0, 0, 170);
-  rect(0, 0, width, height);
+  fill(0,0,0,175);
+  rect(0,0,width,height);
 
-  textAlign(CENTER, CENTER);
+  fill(255);
+  textAlign(CENTER,CENTER);
   textSize(26);
-  fill(255);
-  text(isWin ? "YOU ESCAPED ✅" : "TIME UP ⏳", width/2, height/2 - 60);
+  text(isWin ? "YOU ESCAPED ✅" : "GAME OVER ☠️", width/2, height/2-60);
 
   textSize(14);
-  text(`Final Score: ${score}`, width/2, height/2 - 18);
+  text(`Final Score: ${score}`, width/2, height/2-18);
 
   textSize(13);
-  text("Press R to restart.", width/2, height/2 + 35);
+  text("Press R to restart.", width/2, height/2+35);
 }
 
-function keyPressed() {
-  if (key === 'r' || key === 'R') {
-    resetGame();
-    return;
-  }
-  if (state === "START" && keyCode === 32) { // SPACE
-    state = "PLAY";
-    startTimeMs = millis();
-  }
-}
-
-function updateTimerAndScore() {
-  const elapsedSec = (millis() - startTimeMs) / 1000.0;
-  timeLeft = timeLimitSec - elapsedSec;
-
-  // score: start 100, minus 1 per second
-  score = max(0, 100 - floor(elapsedSec));
-
-  if (timeLeft <= 0 || score <= 0) {
-    timeLeft = 0;
-    score = 0;
-    state = "LOSE";
-  }
-}
-
-function handleMovement() {
-  let dx = 0, dy = 0;
-  const sp = player.speed;
-
-  if (keyIsDown(LEFT_ARROW) || keyIsDown(65)) dx -= sp;
-  if (keyIsDown(RIGHT_ARROW) || keyIsDown(68)) dx += sp;
-  if (keyIsDown(UP_ARROW) || keyIsDown(87)) dy -= sp;
-  if (keyIsDown(DOWN_ARROW) || keyIsDown(83)) dy += sp;
-
-  if (dx !== 0 || dy !== 0) {
-    const mag = Math.hypot(dx, dy);
-    if (mag > sp) {
-      dx = dx / mag * sp;
-      dy = dy / mag * sp;
-    }
-    tryMove(dx, dy);
-  }
-}
-
-function tryMove(dx, dy) {
-  const newX = player.x + dx;
-  const newY = player.y + dy;
-
-  if (!collidesWithWall(newX, player.y, player.r)) player.x = newX;
-  if (!collidesWithWall(player.x, newY, player.r)) player.y = newY;
-}
-
-function collidesWithWall(cx, cy, r) {
-  const minX = floor((cx - r) / cellSize);
-  const maxX = floor((cx + r) / cellSize);
-  const minY = floor((cy - r) / cellSize);
-  const maxY = floor((cy + r) / cellSize);
-
-  for (let y = minY; y <= maxY; y++) {
-    for (let x = minX; x <= maxX; x++) {
-      if (x < 0 || y < 0 || x >= cols || y >= rows) return true;
-      if (maze[y][x] === 1) {
-        const rx = x * cellSize;
-        const ry = y * cellSize;
-        const closestX = constrain(cx, rx, rx + cellSize);
-        const closestY = constrain(cy, ry, ry + cellSize);
-        const distSq = (cx - closestX) ** 2 + (cy - closestY) ** 2;
-        if (distSq < r * r) return true;
+/* ================= Draw ================= */
+function drawMaze(){
+  for (let y=0;y<rows;y++){
+    for (let x=0;x<cols;x++){
+      if (maze[y][x]===1){
+        fill(40,55,95);
+        stroke(255,255,255,18);
+        rect(x*cellSize,y*cellSize,cellSize,cellSize,5);
+      } else {
+        noStroke();
+        fill(255,255,255,6);
+        rect(x*cellSize,y*cellSize,cellSize,cellSize);
       }
+    }
+  }
+}
+
+function drawExit(){
+  const ex=exitCell.x*cellSize, ey=exitCell.y*cellSize;
+  noStroke();
+  fill(120,210,255,80);
+  rect(ex+4,ey+4,cellSize-8,cellSize-8,10);
+  fill(120,210,255);
+  textSize(11);
+  textAlign(CENTER,CENTER);
+  text("EXIT", ex+cellSize/2, ey+cellSize/2);
+}
+
+function drawGates(){
+  for (const g of gates){
+    const gx=g.x*cellSize, gy=g.y*cellSize;
+    if (g.open){
+      noStroke();
+      fill(120,210,255,18);
+      rect(gx+10, gy+6, cellSize-20, cellSize-12, 8);
+      continue;
+    }
+    noStroke();
+    fill(120,210,255,35);
+    rect(gx+6, gy+4, cellSize-12, cellSize-8, 10);
+
+    fill(180,245,255,130);
+    rect(gx + cellSize*0.45, gy+6, cellSize*0.10, cellSize-12, 6);
+
+    fill(200,255,255);
+    textSize(10);
+    textAlign(CENTER,CENTER);
+    text("G"+g.id, gx+cellSize/2, gy+cellSize*0.20);
+  }
+}
+
+function drawKeys(){
+  for (const k of keys){
+    if (k.collected) continue;
+
+    const kx=k.x*cellSize+cellSize/2;
+    const ky=k.y*cellSize+cellSize/2;
+
+    let tint;
+    if (k.id===1) tint=[255,215,90];
+    else if (k.id===2) tint=[255,120,220];
+    else tint=[120,255,170];
+
+    noStroke();
+    fill(tint[0],tint[1],tint[2],75);
+    circle(kx,ky,cellSize*0.90);
+
+    fill(tint[0],tint[1],tint[2]);
+    circle(kx-6,ky,12);
+    rect(kx-2,ky-3,18,6,3);
+    rect(kx+10,ky-3,4,10,2);
+
+    fill(255);
+    textSize(10);
+    textAlign(CENTER,CENTER);
+    text("K"+k.id, kx, ky - cellSize*0.35);
+  }
+}
+
+function drawPlayer(){
+  noStroke();
+  fill(255,215,90);
+  circle(player.x,player.y,player.r*2);
+  fill(30);
+  circle(player.x+player.r*0.35, player.y-player.r*0.15, player.r*0.35);
+}
+
+function drawMonster(){
+  noStroke();
+  fill(255,90,120);
+  circle(monster.x,monster.y,monster.r*2);
+  fill(30);
+  circle(monster.x-monster.r*0.25, monster.y-monster.r*0.1, monster.r*0.25);
+  circle(monster.x+monster.r*0.25, monster.y-monster.r*0.1, monster.r*0.25);
+}
+
+/* ================= Input ================= */
+function keyPressed(){
+  if (key==='r' || key==='R'){ resetGame(); return; }
+  if (state==="START" && keyCode===32){ state="PLAY"; startTimeMs=millis(); }
+}
+
+/* ================= Time/Score ================= */
+function elapsedSeconds(){ return (millis()-startTimeMs)/1000.0; }
+function updateTimerAndScore(){
+  const e=elapsedSeconds();
+  timeLeft=timeLimitSec-e;
+  score=max(0, scoreStart-floor(e));
+  if (timeLeft<=0 || score<=0){ timeLeft=0; score=0; state="LOSE"; }
+}
+
+/* ================= Movement/Collision ================= */
+function handleMovement(){
+  let dx=0, dy=0;
+  const sp=player.speed;
+  if (keyIsDown(LEFT_ARROW)||keyIsDown(65)) dx-=sp;
+  if (keyIsDown(RIGHT_ARROW)||keyIsDown(68)) dx+=sp;
+  if (keyIsDown(UP_ARROW)||keyIsDown(87)) dy-=sp;
+  if (keyIsDown(DOWN_ARROW)||keyIsDown(83)) dy+=sp;
+
+  if (dx||dy){
+    const mag=Math.hypot(dx,dy);
+    if (mag>sp){ dx=dx/mag*sp; dy=dy/mag*sp; }
+    tryMove(player, dx, dy);
+  }
+}
+
+function tryMove(ent, dx, dy){
+  const nx=ent.x+dx, ny=ent.y+dy;
+  if (!collides(nx, ent.y, ent.r)) ent.x=nx;
+  if (!collides(ent.x, ny, ent.r)) ent.y=ny;
+}
+
+function collides(cx,cy,r){
+  const minX=floor((cx-r)/cellSize), maxX=floor((cx+r)/cellSize);
+  const minY=floor((cy-r)/cellSize), maxY=floor((cy+r)/cellSize);
+
+  for (let y=minY;y<=maxY;y++) for (let x=minX;x<=maxX;x++){
+    if (x<0||y<0||x>=cols||y>=rows) return true;
+
+    if (maze[y][x]===1){
+      if (circleRectHit(cx,cy,r, x*cellSize,y*cellSize, cellSize,cellSize)) return true;
+    }
+    const g = gateAtCell(x,y);
+    if (g && !g.open){
+      if (circleRectHit(cx,cy,r, x*cellSize,y*cellSize, cellSize,cellSize)) return true;
     }
   }
   return false;
 }
 
-function checkPickKey() {
-  if (hasKey) return;
+function circleRectHit(cx,cy,r, rx,ry,rw,rh){
+  const px=constrain(cx,rx,rx+rw);
+  const py=constrain(cy,ry,ry+rh);
+  return ((cx-px)**2 + (cy-py)**2) < r*r;
+}
 
-  const px = floor(player.x / cellSize);
-  const py = floor(player.y / cellSize);
-
-  if (px === keyCell.x && py === keyCell.y) {
-    hasKey = true;
+/* ================= Keys/Gates ================= */
+function checkPickKeys(){
+  const px=floor(player.x/cellSize), py=floor(player.y/cellSize);
+  for (const k of keys){
+    if (!k.collected && px===k.x && py===k.y){
+      k.collected=true;
+      keysCollected++;
+    }
   }
 }
 
-function checkWinLose() {
-  if (state !== "PLAY") return;
-
-  const px = floor(player.x / cellSize);
-  const py = floor(player.y / cellSize);
-
-  // Must have key AND be on exit tile
-  if (hasKey && px === exitCell.x && py === exitCell.y) {
-    state = "WIN";
+function updateGatesFromKeys(){
+  for (const g of gates){
+    const k=keys.find(kk=>kk.id===g.id);
+    g.open = !!(k && k.collected);
   }
 }
 
-/* ===== Key spawn: far from exit ===== */
-function spawnKeyCellFarFromExit() {
-  // collect all open cells that satisfy distance rule
-  let candidates = [];
-  for (let y = 1; y < rows - 1; y++) {
-    for (let x = 1; x < cols - 1; x++) {
-      if (maze[y][x] === 0) {
-        const d = manhattan(x, y, exitCell.x, exitCell.y);
-        // also avoid spawning on exit itself
-        if (d >= KEY_SAFE_DIST && !(x === exitCell.x && y === exitCell.y)) {
-          candidates.push({x, y});
-        }
-      }
-    }
-  }
+function allGatesOpen(){ return gates.every(g=>g.open); }
 
-  // if maze is tiny or unlucky, relax rule gradually
-  let dist = KEY_SAFE_DIST;
-  while (candidates.length === 0 && dist > 2) {
-    dist--;
-    for (let y = 1; y < rows - 1; y++) {
-      for (let x = 1; x < cols - 1; x++) {
-        if (maze[y][x] === 0) {
-          const d = manhattan(x, y, exitCell.x, exitCell.y);
-          if (d >= dist && !(x === exitCell.x && y === exitCell.y)) {
-            candidates.push({x, y});
-          }
-        }
-      }
-    }
-  }
-
-  // final fallback: any open cell not on exit
-  if (candidates.length === 0) {
-    for (let y = 1; y < rows - 1; y++) {
-      for (let x = 1; x < cols - 1; x++) {
-        if (maze[y][x] === 0 && !(x === exitCell.x && y === exitCell.y)) {
-          candidates.push({x, y});
-        }
-      }
-    }
-  }
-
-  return random(candidates);
+function checkWin(){
+  const px=floor(player.x/cellSize), py=floor(player.y/cellSize);
+  if (allGatesOpen() && px===exitCell.x && py===exitCell.y) state="WIN";
 }
 
-function manhattan(x1, y1, x2, y2) {
-  return abs(x1 - x2) + abs(y1 - y2);
+/* ================= Monster chase ================= */
+function checkMonsterCatchLose(){
+  if (dist(player.x,player.y,monster.x,monster.y) < player.r+monster.r) state="LOSE";
 }
 
-/* ===== Maze generation (DFS carve) ===== */
-function generateMaze(w, h) {
-  let grid = Array.from({length: h}, () => Array.from({length: w}, () => 1));
-
-  function neighbors(cx, cy) {
-    const dirs = [
-      {dx: 2, dy: 0},
-      {dx: -2, dy: 0},
-      {dx: 0, dy: 2},
-      {dx: 0, dy: -2},
-    ];
-    let list = [];
-    for (const d of dirs) {
-      const nx = cx + d.dx, ny = cy + d.dy;
-      if (nx > 0 && ny > 0 && nx < w - 1 && ny < h - 1) {
-        list.push({nx, ny, wx: cx + d.dx/2, wy: cy + d.dy/2});
-      }
-    }
-    for (let i = list.length - 1; i > 0; i--) {
-      const j = floor(random(i + 1));
-      [list[i], list[j]] = [list[j], list[i]];
-    }
-    return list;
+function updateMonsterChase(){
+  if (monsterRepathCooldown>0) monsterRepathCooldown--;
+  else {
+    monsterPath=bfsPath(getCellFromPos(monster.x,monster.y), getCellFromPos(player.x,player.y));
+    monsterRepathCooldown=8;
   }
-
-  let stack = [];
-  let sx = 1, sy = 1;
-  grid[sy][sx] = 0;
-  stack.push({x:sx, y:sy});
-
-  while (stack.length > 0) {
-    const cur = stack[stack.length - 1];
-    const opts = neighbors(cur.x, cur.y).filter(n => grid[n.ny][n.nx] === 1);
-
-    if (opts.length === 0) {
-      stack.pop();
-    } else {
-      const pick = opts[0];
-      grid[pick.wy][pick.wx] = 0;
-      grid[pick.ny][pick.nx] = 0;
-      stack.push({x: pick.nx, y: pick.ny});
+  if (monsterPath && monsterPath.length>=2){
+    const next=monsterPath[1];
+    const tx=(next.x+0.5)*cellSize, ty=(next.y+0.5)*cellSize;
+    const vx=tx-monster.x, vy=ty-monster.y;
+    const d=Math.hypot(vx,vy);
+    if (d>0.1){
+      const step=monster.speed;
+      tryMove(monster, (vx/d)*min(step,d), (vy/d)*min(step,d));
     }
   }
-
-  // punch a few extra holes (makes it less corridor-ish)
-  for (let k = 0; k < 18; k++) {
-    const x = floor(random(1, w-1));
-    const y = floor(random(1, h-1));
-    if (grid[y][x] === 1 && countOpenNeighbors(grid, x, y) >= 2) {
-      grid[y][x] = 0;
-    }
-  }
-
-  return grid;
 }
 
-function countOpenNeighbors(grid, x, y) {
-  const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
-  let c = 0;
-  for (const [dx,dy] of dirs) {
-    const nx = x+dx, ny = y+dy;
-    if (ny>=0 && ny<rows && nx>=0 && nx<cols && grid[ny][nx]===0) c++;
+/* ================= BFS ================= */
+function getCellFromPos(px,py){
+  return { x:constrain(floor(px/cellSize),0,cols-1), y:constrain(floor(py/cellSize),0,rows-1) };
+}
+
+function gateAtCell(x,y){
+  for (const g of gates) if (g.x===x && g.y===y) return g;
+  return null;
+}
+
+function passable(x,y){
+  if (x<0||y<0||x>=cols||y>=rows) return false;
+  if (maze[y][x]===1) return false;
+  const g=gateAtCell(x,y);
+  if (g && !g.open) return false;
+  return true;
+}
+
+function bfsPath(start, goal){
+  if (start.x===goal.x && start.y===goal.y) return [start];
+
+  const q=[start];
+  const vis=Array.from({length:rows},()=>Array(cols).fill(false));
+  const par=Array.from({length:rows},()=>Array(cols).fill(null));
+  vis[start.y][start.x]=true;
+
+  const dirs=[{dx:1,dy:0},{dx:-1,dy:0},{dx:0,dy:1},{dx:0,dy:-1}];
+
+  while(q.length){
+    const cur=q.shift();
+    if (cur.x===goal.x && cur.y===goal.y) break;
+
+    for (const d of dirs){
+      const nx=cur.x+d.dx, ny=cur.y+d.dy;
+      if (nx<0||ny<0||nx>=cols||ny>=rows) continue;
+      if (vis[ny][nx]) continue;
+      if (!passable(nx,ny)) continue;
+
+      vis[ny][nx]=true;
+      par[ny][nx]=cur;
+      q.push({x:nx,y:ny});
+    }
+  }
+
+  if (!vis[goal.y][goal.x]) return [];
+  const path=[];
+  let cur=goal;
+  while(cur){ path.push(cur); cur=par[cur.y][cur.x]; }
+  path.reverse();
+  return path;
+}
+
+function bfsDistanceNoGates(start, goal){
+  if (start.x===goal.x && start.y===goal.y) return 0;
+  const q=[start];
+  const distArr=Array.from({length:rows},()=>Array(cols).fill(-1));
+  distArr[start.y][start.x]=0;
+
+  const dirs=[{dx:1,dy:0},{dx:-1,dy:0},{dx:0,dy:1},{dx:0,dy:-1}];
+
+  while(q.length){
+    const cur=q.shift();
+    const cd=distArr[cur.y][cur.x];
+    for(const d of dirs){
+      const nx=cur.x+d.dx, ny=cur.y+d.dy;
+      if(nx<0||ny<0||nx>=cols||ny>=rows) continue;
+      if(distArr[ny][nx]!==-1) continue;
+      if(maze[ny][nx]===1) continue;
+      distArr[ny][nx]=cd+1;
+      if(nx===goal.x && ny===goal.y) return distArr[ny][nx];
+      q.push({x:nx,y:ny});
+    }
+  }
+  return -1;
+}
+
+function bfsPathNoGates(start, goal){
+  if (start.x===goal.x && start.y===goal.y) return [start];
+  const q=[start];
+  const vis=Array.from({length:rows},()=>Array(cols).fill(false));
+  const par=Array.from({length:rows},()=>Array(cols).fill(null));
+  vis[start.y][start.x]=true;
+  const dirs=[{dx:1,dy:0},{dx:-1,dy:0},{dx:0,dy:1},{dx:0,dy:-1}];
+
+  while(q.length){
+    const cur=q.shift();
+    if(cur.x===goal.x && cur.y===goal.y) break;
+    for(const d of dirs){
+      const nx=cur.x+d.dx, ny=cur.y+d.dy;
+      if(nx<0||ny<0||nx>=cols||ny>=rows) continue;
+      if(vis[ny][nx]) continue;
+      if(maze[ny][nx]===1) continue;
+      vis[ny][nx]=true;
+      par[ny][nx]=cur;
+      q.push({x:nx,y:ny});
+    }
+  }
+  if(!vis[goal.y][goal.x]) return [];
+  const path=[];
+  let cur=goal;
+  while(cur){ path.push(cur); cur=par[cur.y][cur.x]; }
+  path.reverse();
+  return path;
+}
+
+/* ================= Start fairness ================= */
+function degree(cell){
+  const dirs=[[1,0],[-1,0],[0,1],[0,-1]];
+  let c=0;
+  for (const [dx,dy] of dirs){
+    const nx=cell.x+dx, ny=cell.y+dy;
+    if(nx<0||ny<0||nx>=cols||ny>=rows) continue;
+    if(maze[ny][nx]===0) c++;
   }
   return c;
 }
 
-function findOpenNear(tx, ty) {
-  for (let r = 0; r < max(cols, rows); r++) {
-    for (let y = ty - r; y <= ty + r; y++) {
-      for (let x = tx - r; x <= tx + r; x++) {
-        if (x >= 1 && y >= 1 && x <= cols-2 && y <= rows-2) {
-          if (maze[y][x] === 0) return {x, y};
-        }
+function getOpenNeighbors(cell){
+  const dirs=[[1,0],[-1,0],[0,1],[0,-1]];
+  const list=[];
+  for(const [dx,dy] of dirs){
+    const nx=cell.x+dx, ny=cell.y+dy;
+    if(nx<0||ny<0||nx>=cols||ny>=rows) continue;
+    if(maze[ny][nx]===0) list.push({x:nx,y:ny});
+  }
+  return list;
+}
+
+function branchLengthFrom(junction, stepCell){
+  // BFS from stepCell, forbid returning into junction, measure max distance
+  const q=[stepCell];
+  const distArr=Array.from({length:rows},()=>Array(cols).fill(-1));
+  distArr[stepCell.y][stepCell.x]=0;
+  const dirs=[[1,0],[-1,0],[0,1],[0,-1]];
+  let maxD=0;
+
+  while(q.length){
+    const cur=q.shift();
+    const cd=distArr[cur.y][cur.x];
+    maxD=max(maxD,cd);
+    for(const [dx,dy] of dirs){
+      const nx=cur.x+dx, ny=cur.y+dy;
+      if(nx<0||ny<0||nx>=cols||ny>=rows) continue;
+      if(distArr[ny][nx]!==-1) continue;
+      if(maze[ny][nx]===1) continue;
+      if(nx===junction.x && ny===junction.y) continue;
+      distArr[ny][nx]=cd+1;
+      q.push({x:nx,y:ny});
+    }
+  }
+  return maxD;
+}
+
+function pickStartJunction(){
+  const candidates=[];
+  for (let y=1;y<rows-1;y++){
+    for (let x=1;x<cols-1;x++){
+      if (maze[y][x]!==0) continue;
+      const c={x,y};
+      if (degree(c) >= 3) candidates.push(c);
+    }
+  }
+  if (!candidates.length) return null;
+  return random(candidates);
+}
+
+function spawnMonsterFairFromStartJunction(startJ){
+  // Monster candidates far away
+  const candidates=[];
+  for (let y=1;y<rows-1;y++){
+    for (let x=1;x<cols-1;x++){
+      if(maze[y][x]!==0) continue;
+      const d=bfsDistanceNoGates(startJ,{x,y});
+      if(d>=MIN_MONSTER_DIST) candidates.push({x,y});
+    }
+  }
+  if (!candidates.length) return null;
+
+  const exits = getOpenNeighbors(startJ);
+  if (exits.length < 3) return null; // should be junction anyway
+
+  // Try random monsters until start junction still has an escape branch
+  for (let t=0;t<200;t++){
+    const m = random(candidates);
+
+    // Determine which exit from startJ is on the path toward monster
+    const path = bfsPathNoGates(startJ, m);
+    if (!path || path.length < 2) continue;
+    const monsterExit = path[1]; // neighbor cell
+
+    // Need at least one other exit with long branch
+    let okEscape=false;
+    for (const ex of exits){
+      if (ex.x===monsterExit.x && ex.y===monsterExit.y) continue;
+      if (branchLengthFrom(startJ, ex) >= MIN_ESCAPE_BRANCH_LEN){
+        okEscape=true; break;
+      }
+    }
+    if (!okEscape) continue;
+
+    return m;
+  }
+  return null;
+}
+
+/* ================= Exit hallway + gates-in-front ================= */
+function forceExitHallway(exitC){
+  // Try four directions. We want: Exit at end, then 3 gate cells extending outward.
+  // Choose direction that stays within bounds (not hitting borders).
+  const dirs = [
+    {dx:-1,dy:0}, // hallway extends left from exit
+    {dx:1,dy:0},  // right
+    {dx:0,dy:-1}, // up
+    {dx:0,dy:1},  // down
+  ];
+
+  // Prefer direction that already has a path neighbor (less destructive)
+  dirs.sort((a,b)=>{
+    const na = (maze[exitC.y+a.dy]?.[exitC.x+a.dx]===0) ? 0 : 1;
+    const nb = (maze[exitC.y+b.dy]?.[exitC.x+b.dx]===0) ? 0 : 1;
+    return na-nb;
+  });
+
+  for (const d of dirs){
+    const g1 = {x: exitC.x + d.dx*1, y: exitC.y + d.dy*1};
+    const g2 = {x: exitC.x + d.dx*2, y: exitC.y + d.dy*2};
+    const g3 = {x: exitC.x + d.dx*3, y: exitC.y + d.dy*3};
+    const tail = {x: exitC.x + d.dx*4, y: exitC.y + d.dy*4};
+
+    if (!inInnerBounds(g1) || !inInnerBounds(g2) || !inInnerBounds(g3) || !inInnerBounds(tail)) continue;
+
+    // carve exit + hallway cells to paths
+    maze[exitC.y][exitC.x] = 0;
+    maze[g1.y][g1.x] = 0;
+    maze[g2.y][g2.x] = 0;
+    maze[g3.y][g3.x] = 0;
+    maze[tail.y][tail.x] = 0;
+
+    // ensure tail connects to the rest of maze (if not, carve one neighbor)
+    ensureConnected(tail, {x:g3.x,y:g3.y});
+
+    return { gates: [g1,g2,g3] };
+  }
+  return null;
+}
+
+function inInnerBounds(c){
+  return c.x>=1 && c.y>=1 && c.x<=cols-2 && c.y<=rows-2;
+}
+
+function ensureConnected(cell, backCell){
+  // If any neighbor (except backCell) is already open path, we're connected.
+  const nbs = [
+    {x:cell.x+1,y:cell.y},{x:cell.x-1,y:cell.y},{x:cell.x,y:cell.y+1},{x:cell.x,y:cell.y-1}
+  ];
+  for (const nb of nbs){
+    if (!inInnerBounds(nb)) continue;
+    if (nb.x===backCell.x && nb.y===backCell.y) continue;
+    if (maze[nb.y][nb.x]===0) return;
+  }
+  // Otherwise carve one random neighbor to connect
+  const options = nbs.filter(nb=>inInnerBounds(nb) && !(nb.x===backCell.x && nb.y===backCell.y));
+  if (options.length){
+    const pick = random(options);
+    maze[pick.y][pick.x]=0;
+  }
+}
+
+/* ================= Keys placement ================= */
+function placeMultipleKeys(playerCell, exitCell, gates, count){
+  const forbidden = new Set();
+  forbidden.add(`${exitCell.x},${exitCell.y}`);
+  for (const g of gates) forbidden.add(`${g.x},${g.y}`);
+
+  let candidates=[];
+  for (let y=1;y<rows-1;y++){
+    for (let x=1;x<cols-1;x++){
+      if (maze[y][x]!==0) continue;
+      if (forbidden.has(`${x},${y}`)) continue;
+
+      const de=abs(x-exitCell.x)+abs(y-exitCell.y);
+      const dp=abs(x-playerCell.x)+abs(y-playerCell.y);
+      if (de>=KEY_SAFE_DIST_EXIT && dp>=KEY_SAFE_DIST_PLAYER) candidates.push({x,y});
+    }
+  }
+  if (candidates.length < count) return null;
+
+  const chosen=[];
+  for (let tries=0; tries<1200 && chosen.length<count; tries++){
+    const c=random(candidates);
+    let ok=true;
+    for (const s of chosen){
+      if (abs(s.x-c.x)+abs(s.y-c.y) < 7) { ok=false; break; }
+    }
+    if (!ok) continue;
+    chosen.push(c);
+  }
+  if (chosen.length!==count) return null;
+
+  return chosen.map((c,i)=>({x:c.x,y:c.y,id:i+1,collected:false}));
+}
+
+/* ================= Helpers ================= */
+function findOpenNear(tx,ty){
+  for (let r=0;r<max(cols,rows);r++){
+    for (let y=ty-r;y<=ty+r;y++){
+      for (let x=tx-r;x<=tx+r;x++){
+        if(x>=1&&y>=1&&x<=cols-2&&y<=rows-2 && maze[y][x]===0) return {x,y};
       }
     }
   }
-  return {x: 1, y: 1};
+  // fallback: carve target itself
+  maze[ty][tx]=0;
+  return {x:tx,y:ty};
+}
+
+/* ================= Maze generation: Randomized Prim ================= */
+function generateMazePrim(w,h){
+  const g=Array.from({length:h},()=>Array(w).fill(1));
+  function inBounds(x,y){ return x>0&&y>0&&x<w-1&&y<h-1; }
+
+  const sx=1, sy=1;
+  g[sy][sx]=0;
+
+  const frontier=[];
+  function addFrontier(cx,cy){
+    const dirs=[{dx:2,dy:0},{dx:-2,dy:0},{dx:0,dy:2},{dx:0,dy:-2}];
+    for(const d of dirs){
+      const nx=cx+d.dx, ny=cy+d.dy;
+      if(!inBounds(nx,ny)) continue;
+      if(g[ny][nx]===1){
+        frontier.push({to:{x:nx,y:ny}, wall:{x:cx+d.dx/2,y:cy+d.dy/2}});
+      }
+    }
+  }
+  addFrontier(sx,sy);
+
+  while(frontier.length){
+    const idx=floor(random(frontier.length));
+    const f=frontier.splice(idx,1)[0];
+    const tx=f.to.x, ty=f.to.y;
+    if(g[ty][tx]===0) continue;
+    g[f.wall.y][f.wall.x]=0;
+    g[ty][tx]=0;
+    addFrontier(tx,ty);
+  }
+  return g;
+}
+
+function braidMaze(g, prob){
+  const dirs=[{dx:1,dy:0},{dx:-1,dy:0},{dx:0,dy:1},{dx:0,dy:-1}];
+  for(let y=1;y<rows-1;y++) for(let x=1;x<cols-1;x++){
+    if(g[y][x]!==0) continue;
+    let openN=0;
+    for(const d of dirs) if(g[y+d.dy][x+d.dx]===0) openN++;
+    if(openN===1 && random()<prob){
+      const walls=[];
+      for(const d of dirs){
+        const nx=x+d.dx, ny=y+d.dy;
+        if(nx<=0||ny<=0||nx>=cols-1||ny>=rows-1) continue;
+        if(g[ny][nx]===1) walls.push({x:nx,y:ny});
+      }
+      if(walls.length){
+        const pick=random(walls);
+        g[pick.y][pick.x]=0;
+      }
+    }
+  }
+}
+
+function punchExtraHoles(g, count){
+  let tries=0;
+  while(count>0 && tries<2500){
+    tries++;
+    const x=floor(random(2,cols-2));
+    const y=floor(random(2,rows-2));
+    if(g[y][x]===1){
+      let open=0;
+      if(g[y][x+1]===0) open++;
+      if(g[y][x-1]===0) open++;
+      if(g[y+1][x]===0) open++;
+      if(g[y-1][x]===0) open++;
+      if(open>=2){ g[y][x]=0; count--; }
+    }
+  }
 }
 </script>
 </body>
