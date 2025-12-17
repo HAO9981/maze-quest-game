@@ -59,6 +59,8 @@ let score = scoreStart;
 // Difficulty knobs
 const BRAID_PROB = 0.18;
 const EXTRA_HOLES = 18;
+const CORNER_ASSIST = 0.35; // 0.2~0.6，越大越“吸附”
+
 
 // Spawn constraints
 const KEY_SAFE_DIST_EXIT = 10;
@@ -119,8 +121,9 @@ function resetGame() {
       r: cellSize*0.29,
       x: (monsterCell.x+0.5)*cellSize,
       y: (monsterCell.y+0.5)*cellSize,
-      speed: 2.65
+      speed: 1.65
     };
+    
 
     ok = true;
     break;
