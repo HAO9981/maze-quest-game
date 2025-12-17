@@ -27,6 +27,11 @@
    - Monster spawn must satisfy:
      from player junction, monster approaches via one exit,
      and there exists at least one OTHER escape branch with length >= MIN_ESCAPE_BRANCH_LEN
+
+   NEW:
+   - Player & Monster cannot spawn near Exit (BFS distance)
+   - Exit must have ONLY ONE route (only connects to Gate1)
+   - Junctions slightly widened + smaller player radius + diagonal turning assist
 ========================= */
 
 let state = "START";
@@ -59,16 +64,26 @@ let score = scoreStart;
 // Difficulty knobs
 const BRAID_PROB = 0.18;
 const EXTRA_HOLES = 18;
-const CORNER_ASSIST = 0.35; // 0.2~0.6，越大越“吸附”
 
+// ✅ Turn-corner assist
+const CORNER_ASSIST = 0.45; // stronger snap for smoother cornering
 
-// Spawn constraints
+// Spawn constraints (keys)
 const KEY_SAFE_DIST_EXIT = 10;
 const KEY_SAFE_DIST_PLAYER = 8;
 
+// ✅ New: spawn far from exit
+const MIN_PLAYER_DIST_FROM_EXIT = 14;   // BFS steps
+const MIN_MONSTER_DIST_FROM_EXIT = 14;  // BFS steps
+
 // Fairness knobs (this prevents “开局必死”)
-const MIN_MONSTER_DIST = 14;        // monster at least this BFS steps away
+const MIN_MONSTER_DIST = 14;        // monster at least this BFS steps away from player at start
 const MIN_ESCAPE_BRANCH_LEN = 12;   // at start junction, at least one non-monster branch has this length
+
+// ✅ New: widen junctions a bit (small, controlled)
+const WIDEN_JUNCTION_PROB = 0.55;
+const WIDEN_JUNCTION_MAX_WALLS = 2; // per junction carve at most N wall tiles
+const WIDEN_SKIP_DIST_FROM_EXIT = 4; // don’t mess with exit corridor area
 
 function setup() {
   createCanvas(cols * cellSize, rows * cellSize + 80);
@@ -77,11 +92,12 @@ function setup() {
 }
 
 function resetGame() {
-  const MAX_TRIES = 260;
+  const MAX_TRIES = 320;
   let ok = false;
 
   for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
     maze = generateMazePrim(cols, rows);
+
     // borders
     for (let x=0;x<cols;x++){ maze[0][x]=1; maze[rows-1][x]=1; }
     for (let y=0;y<rows;y++){ maze[y][0]=1; maze[y][cols-1]=1; }
@@ -98,32 +114,39 @@ function resetGame() {
 
     gates = forced.gates.map((c,i)=>({x:c.x,y:c.y,id:i+1,open:false}));
 
-    // Pick player start: MUST be junction (degree>=3)
-    const startCell = pickStartJunction();
+    // ✅ Enforce exit has only one route: only connect exit <-> gate1
+    enforceSingleExitRoute(exitCell, forced.gates[0]);
+
+    // ✅ Widen junctions slightly (but do NOT touch exit corridor region)
+    widenJunctions(maze, exitCell, gates);
+
+    // Pick player start: MUST be junction (degree>=3) AND far from exit
+    const startCell = pickStartJunctionFarFromExit();
     if (!startCell) continue;
 
     // Place 3 keys far from exit + far from start + not on gates/hallway
     keys = placeMultipleKeys(startCell, exitCell, gates, KEY_COUNT);
     if (!keys) continue;
 
-    // Spawn monster: must be far AND must not create forced-death at start junction
+    // Spawn monster: far from player, far from exit, and no forced-death at start
     const monsterCell = spawnMonsterFairFromStartJunction(startCell);
     if (!monsterCell) continue;
 
     // Commit entities
     player = {
-      r: cellSize*0.30,
+      r: cellSize*0.23,   // ✅恢复旧的碰撞半径
       x: (startCell.x+0.5)*cellSize,
       y: (startCell.y+0.5)*cellSize,
       speed: 3.1
     };
+
+
     monster = {
-      r: cellSize*0.29,
+      r: cellSize*0.22,
       x: (monsterCell.x+0.5)*cellSize,
       y: (monsterCell.y+0.5)*cellSize,
       speed: 2.0
     };
-    
 
     ok = true;
     break;
@@ -132,11 +155,11 @@ function resetGame() {
   if (!ok) {
     // fallback (rare)
     const startCell = {x:1,y:1};
-    player = { r: cellSize*0.30, x:(startCell.x+0.5)*cellSize, y:(startCell.y+0.5)*cellSize, speed:3.1 };
+    player = { r: cellSize*0.22, x:(startCell.x+0.5)*cellSize, y:(startCell.y+0.5)*cellSize, speed:3.1 };
     exitCell = {x:cols-2,y:rows-2};
     gates = [{x:cols-3,y:rows-2,id:1,open:false},{x:cols-4,y:rows-2,id:2,open:false},{x:cols-5,y:rows-2,id:3,open:false}];
     keys = [{x:3,y:3,id:1,collected:false},{x:7,y:7,id:2,collected:false},{x:5,y:9,id:3,collected:false}];
-    monster = { r: cellSize*0.29, x:(cols-2+0.5)*cellSize, y:(1+0.5)*cellSize, speed:2.65 };
+    monster = { r: cellSize*0.22, x:(cols-2+0.5)*cellSize, y:(1+0.5)*cellSize, speed:1.65 };
   }
 
   keysCollected = 0;
@@ -196,7 +219,7 @@ function drawUI(){
 
   textSize(12);
   fill(255,255,255,210);
-  text("3 light walls block the exit directly. Start is always a junction (no forced-death).", 14, uiY+26);
+  text("Exit has one route only. Player/Monster won't spawn near Exit. Junctions are wider.", 14, uiY+26);
 
   textAlign(RIGHT,CENTER);
   textSize(14);
@@ -352,22 +375,45 @@ function updateTimerAndScore(){
 function handleMovement(){
   let dx=0, dy=0;
   const sp=player.speed;
-  if (keyIsDown(LEFT_ARROW)||keyIsDown(65)) dx-=sp;
-  if (keyIsDown(RIGHT_ARROW)||keyIsDown(68)) dx+=sp;
-  if (keyIsDown(UP_ARROW)||keyIsDown(87)) dy-=sp;
-  if (keyIsDown(DOWN_ARROW)||keyIsDown(83)) dy+=sp;
 
-  if (dx||dy){
-    const mag=Math.hypot(dx,dy);
-    if (mag>sp){ dx=dx/mag*sp; dy=dy/mag*sp; }
-    tryMove(player, dx, dy);
+  if (keyIsDown(LEFT_ARROW) || keyIsDown(65)) dx -= sp; // A
+  if (keyIsDown(RIGHT_ARROW) || keyIsDown(68)) dx += sp; // D
+  if (keyIsDown(UP_ARROW) || keyIsDown(87)) dy -= sp; // W
+  if (keyIsDown(DOWN_ARROW) || keyIsDown(83)) dy += sp; // S
+
+  if (dx || dy){
+    // ✅ 归一化，斜走不会比直走更快
+    const mag = Math.hypot(dx,dy);
+    dx = dx / mag * sp;
+    dy = dy / mag * sp;
+
+    tryMove(player, dx, dy); // ✅旧碰撞（分轴移动）
   }
 }
+
 
 function tryMove(ent, dx, dy){
   const nx=ent.x+dx, ny=ent.y+dy;
   if (!collides(nx, ent.y, ent.r)) ent.x=nx;
   if (!collides(ent.x, ny, ent.r)) ent.y=ny;
+}
+
+function cornerAssist(ent, dx, dy){
+  if (dx===0 && dy===0) return;
+
+  const cx = floor(ent.x / cellSize);
+  const cy = floor(ent.y / cellSize);
+
+  const centerX = (cx + 0.5) * cellSize;
+  const centerY = (cy + 0.5) * cellSize;
+
+  if (abs(dx) > abs(dy)) {
+    const diffY = centerY - ent.y;
+    ent.y += constrain(diffY, -CORNER_ASSIST*cellSize, CORNER_ASSIST*cellSize);
+  } else {
+    const diffX = centerX - ent.x;
+    ent.x += constrain(diffX, -CORNER_ASSIST*cellSize, CORNER_ASSIST*cellSize);
+  }
 }
 
 function collides(cx,cy,r){
@@ -571,7 +617,6 @@ function getOpenNeighbors(cell){
 }
 
 function branchLengthFrom(junction, stepCell){
-  // BFS from stepCell, forbid returning into junction, measure max distance
   const q=[stepCell];
   const distArr=Array.from({length:rows},()=>Array(cols).fill(-1));
   distArr[stepCell.y][stepCell.x]=0;
@@ -595,13 +640,16 @@ function branchLengthFrom(junction, stepCell){
   return maxD;
 }
 
-function pickStartJunction(){
+function pickStartJunctionFarFromExit(){
   const candidates=[];
   for (let y=1;y<rows-1;y++){
     for (let x=1;x<cols-1;x++){
       if (maze[y][x]!==0) continue;
       const c={x,y};
-      if (degree(c) >= 3) candidates.push(c);
+      if (degree(c) < 3) continue;
+
+      const de = bfsDistanceNoGates(c, exitCell);
+      if (de !== -1 && de >= MIN_PLAYER_DIST_FROM_EXIT) candidates.push(c);
     }
   }
   if (!candidates.length) return null;
@@ -609,30 +657,31 @@ function pickStartJunction(){
 }
 
 function spawnMonsterFairFromStartJunction(startJ){
-  // Monster candidates far away
   const candidates=[];
   for (let y=1;y<rows-1;y++){
     for (let x=1;x<cols-1;x++){
       if(maze[y][x]!==0) continue;
-      const d=bfsDistanceNoGates(startJ,{x,y});
-      if(d>=MIN_MONSTER_DIST) candidates.push({x,y});
+
+      const dPlayer=bfsDistanceNoGates(startJ,{x,y});
+      if(dPlayer < MIN_MONSTER_DIST) continue;
+
+      const dExit=bfsDistanceNoGates({x,y}, exitCell);
+      if(dExit === -1 || dExit < MIN_MONSTER_DIST_FROM_EXIT) continue;
+
+      candidates.push({x,y});
     }
   }
   if (!candidates.length) return null;
 
   const exits = getOpenNeighbors(startJ);
-  if (exits.length < 3) return null; // should be junction anyway
+  if (exits.length < 3) return null;
 
-  // Try random monsters until start junction still has an escape branch
-  for (let t=0;t<200;t++){
+  for (let t=0;t<240;t++){
     const m = random(candidates);
-
-    // Determine which exit from startJ is on the path toward monster
     const path = bfsPathNoGates(startJ, m);
     if (!path || path.length < 2) continue;
-    const monsterExit = path[1]; // neighbor cell
+    const monsterExit = path[1];
 
-    // Need at least one other exit with long branch
     let okEscape=false;
     for (const ex of exits){
       if (ex.x===monsterExit.x && ex.y===monsterExit.y) continue;
@@ -649,16 +698,13 @@ function spawnMonsterFairFromStartJunction(startJ){
 
 /* ================= Exit hallway + gates-in-front ================= */
 function forceExitHallway(exitC){
-  // Try four directions. We want: Exit at end, then 3 gate cells extending outward.
-  // Choose direction that stays within bounds (not hitting borders).
   const dirs = [
-    {dx:-1,dy:0}, // hallway extends left from exit
-    {dx:1,dy:0},  // right
-    {dx:0,dy:-1}, // up
-    {dx:0,dy:1},  // down
+    {dx:-1,dy:0},
+    {dx:1,dy:0},
+    {dx:0,dy:-1},
+    {dx:0,dy:1},
   ];
 
-  // Prefer direction that already has a path neighbor (less destructive)
   dirs.sort((a,b)=>{
     const na = (maze[exitC.y+a.dy]?.[exitC.x+a.dx]===0) ? 0 : 1;
     const nb = (maze[exitC.y+b.dy]?.[exitC.x+b.dx]===0) ? 0 : 1;
@@ -673,14 +719,12 @@ function forceExitHallway(exitC){
 
     if (!inInnerBounds(g1) || !inInnerBounds(g2) || !inInnerBounds(g3) || !inInnerBounds(tail)) continue;
 
-    // carve exit + hallway cells to paths
     maze[exitC.y][exitC.x] = 0;
     maze[g1.y][g1.x] = 0;
     maze[g2.y][g2.x] = 0;
     maze[g3.y][g3.x] = 0;
     maze[tail.y][tail.x] = 0;
 
-    // ensure tail connects to the rest of maze (if not, carve one neighbor)
     ensureConnected(tail, {x:g3.x,y:g3.y});
 
     return { gates: [g1,g2,g3] };
@@ -688,12 +732,80 @@ function forceExitHallway(exitC){
   return null;
 }
 
+function enforceSingleExitRoute(exitC, gate1C){
+  const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+  for (const [dx,dy] of dirs){
+    const nx = exitC.x + dx, ny = exitC.y + dy;
+    if (nx<1||ny<1||nx>cols-2||ny>rows-2) continue;
+
+    // Keep only the neighbor that is gate1, everything else becomes wall
+    if (!(nx===gate1C.x && ny===gate1C.y)){
+      maze[ny][nx] = 1;
+    }
+  }
+  // ensure both exit and gate1 are open
+  maze[exitC.y][exitC.x] = 0;
+  maze[gate1C.y][gate1C.x] = 0;
+}
+
+function widenJunctions(g, exitC, gatesArr){
+  const skipSet = new Set();
+  skipSet.add(`${exitC.x},${exitC.y}`);
+  for (const gg of gatesArr) skipSet.add(`${gg.x},${gg.y}`);
+
+  for (let y=2;y<rows-2;y++){
+    for (let x=2;x<cols-2;x++){
+      if (g[y][x]!==0) continue;
+      const c={x,y};
+      if (degree(c) < 3) continue;
+
+      // don’t widen too close to exit corridor
+      const dExit = abs(x-exitC.x)+abs(y-exitC.y);
+      if (dExit <= WIDEN_SKIP_DIST_FROM_EXIT) continue;
+
+      // don’t widen on top of exit/gates
+      if (skipSet.has(`${x},${y}`)) continue;
+
+      if (random() > WIDEN_JUNCTION_PROB) continue;
+
+      // candidate wall tiles around this junction
+      const walls=[];
+      const dirs=[[1,0],[-1,0],[0,1],[0,-1]];
+      for (const [dx,dy] of dirs){
+        const nx=x+dx, ny=y+dy;
+        if (g[ny][nx]===1) walls.push({x:nx,y:ny});
+      }
+
+      // open up to N walls, but only if doing so doesn’t create giant holes
+      let opened=0;
+      shuffle(walls, true);
+      for (const w of walls){
+        if (opened >= WIDEN_JUNCTION_MAX_WALLS) break;
+
+        // avoid opening adjacent to exit/gates too
+        if (skipSet.has(`${w.x},${w.y}`)) continue;
+
+        // basic safety: only open if it has at least 1 open neighbor already (so it becomes a pocket, not a random shortcut)
+        let openN=0;
+        if (g[w.y][w.x+1]===0) openN++;
+        if (g[w.y][w.x-1]===0) openN++;
+        if (g[w.y+1][w.x]===0) openN++;
+        if (g[w.y-1][w.x]===0) openN++;
+
+        if (openN >= 1){
+          g[w.y][w.x]=0;
+          opened++;
+        }
+      }
+    }
+  }
+}
+
 function inInnerBounds(c){
   return c.x>=1 && c.y>=1 && c.x<=cols-2 && c.y<=rows-2;
 }
 
 function ensureConnected(cell, backCell){
-  // If any neighbor (except backCell) is already open path, we're connected.
   const nbs = [
     {x:cell.x+1,y:cell.y},{x:cell.x-1,y:cell.y},{x:cell.x,y:cell.y+1},{x:cell.x,y:cell.y-1}
   ];
@@ -702,7 +814,6 @@ function ensureConnected(cell, backCell){
     if (nb.x===backCell.x && nb.y===backCell.y) continue;
     if (maze[nb.y][nb.x]===0) return;
   }
-  // Otherwise carve one random neighbor to connect
   const options = nbs.filter(nb=>inInnerBounds(nb) && !(nb.x===backCell.x && nb.y===backCell.y));
   if (options.length){
     const pick = random(options);
@@ -753,7 +864,6 @@ function findOpenNear(tx,ty){
       }
     }
   }
-  // fallback: carve target itself
   maze[ty][tx]=0;
   return {x:tx,y:ty};
 }
@@ -831,4 +941,3 @@ function punchExtraHoles(g, count){
 </script>
 </body>
 </html>
-
