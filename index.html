@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Maze Quest (p5.js) - Sealed Exit Corridor + 3 Gates + 3 Monsters</title>
+  <title>Maze Quest (p5.js) - 3 Modes</title>
   <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
   <style>
     body { margin:0; background:#0b1020; display:flex; justify-content:center; align-items:center; height:100vh; }
@@ -13,47 +13,46 @@
 <body>
 <script>
 /* =========================
-   HARD MODE (SEALED EXIT CORRIDOR)
-   - 3 monsters chase immediately
-   - Lose if ANY monster catches you
-   - Score: 100 - 1/sec
+   3 MODES
+   - Easy:  Small map, 1 monster, 1 key, 1 gate
+   - Medium:Large map, 1 monster, 3 keys, 3 gates
+   - Hard:  Large map, 3 monsters, 3 keys, 3 gates
 
-   Critical Fix (Hardest):
-   - Build Exit corridor: [Exit][G1][G2][G3][Tail]
-   - Seal the corridor: for every cell in that corridor,
-     all side directions are WALL (only corridor forward/back allowed)
-   - Exit connects ONLY to G1 (single-route exit)
-   => No bypass routes after keys open.
-
-   Fair start:
-   - Player spawns at a junction (degree >= 3) AND far from exit corridor
-   - Monsters spawn far from player + far from exit corridor
-   - Avoid forced-death at start junction (must have an escape branch)
-
-   Movement:
-   - Keep diagonal feel (W+D etc.)
-   - Keep old collision feel (split-axis tryMove)
+   Core Rules:
+   - Score: 100 - 1/sec, Time limit depends on mode
+   - Lose if any monster catches player
+   - Sealed Exit Corridor: [Exit][G1][G2][G3][Tail]
+     (for Easy only builds [Exit][G1][Tail], sealed as well)
+   - Exit has ONLY one route (connects only to Gate1)
+   - No big empty rooms: controlled extra holes with anti-2x2 rule
+   - Keep diagonal movement feel (W+D etc.) + split-axis collision
+   - Prevent forced-death start: player at junction, monsters far + escape branch exists
 ========================= */
 
 let state = "START";
 
-// Maze size (odd)
-let cols = 31;
-let rows = 21;
-let cellSize = 26;
+// Mode config
+const MODES = {
+  EASY:   { name:"EASY",   cols:23, rows:17, monsters:1, keys:1, time:140, braid:0.10, holes:8,  mSpeedBase:1.45 },
+  MEDIUM: { name:"MEDIUM", cols:31, rows:21, monsters:1, keys:3, time:160, braid:0.16, holes:16, mSpeedBase:1.65 },
+  HARD:   { name:"HARD",   cols:31, rows:21, monsters:3, keys:3, time:160, braid:0.18, holes:18, mSpeedBase:1.65 },
+};
+let modeKey = "MEDIUM";
+let mode = MODES[modeKey];
 
+// Grid sizing
+let cols, rows, cellSize = 26;
 let maze; // 0 path, 1 wall
 
 let player;
-const MONSTER_COUNT = 3;
 let monsters = []; // [{x,y,r,speed,path,cooldown}]
-
 let exitCell;
 
-const KEY_COUNT = 3;
 let keys = [];   // {x,y,id,collected}
 let gates = [];  // {x,y,id,open}
 let keysCollected = 0;
+
+let corridorCells = []; // sealed corridor cells including tail (+ optional mid gates)
 
 // Time + Score
 let startTimeMs = 0;
@@ -62,11 +61,7 @@ let timeLeft = timeLimitSec;
 let scoreStart = 100;
 let score = scoreStart;
 
-// Maze complexity
-const BRAID_PROB = 0.18;
-const EXTRA_HOLES = 18;
-
-// Keys placement constraints
+// Placement constraints
 const KEY_SAFE_DIST_EXIT = 10;
 const KEY_SAFE_DIST_PLAYER = 8;
 
@@ -74,18 +69,31 @@ const KEY_SAFE_DIST_PLAYER = 8;
 const MIN_PLAYER_DIST_FROM_EXIT = 16;   // BFS steps
 const MIN_MONSTER_DIST_FROM_EXIT = 16;  // BFS steps
 
-// Fairness knobs (prevents forced-death)
+// Fairness knobs
 const MIN_MONSTER_DIST = 14;        // monster at least this BFS steps away from player at start
 const MIN_ESCAPE_BRANCH_LEN = 12;   // start junction needs at least one long escape branch
 
 function setup() {
+  applyMode(modeKey);
+}
+
+function applyMode(key){
+  modeKey = key;
+  mode = MODES[modeKey];
+
+  cols = mode.cols;
+  rows = mode.rows;
+
+  // Canvas fits + UI bar
   createCanvas(cols * cellSize, rows * cellSize + 80);
   textFont("Arial");
+
+  timeLimitSec = mode.time;
   resetGame();
 }
 
 function resetGame() {
-  const MAX_TRIES = 420;
+  const MAX_TRIES = 520;
   let ok = false;
 
   for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
@@ -95,44 +103,45 @@ function resetGame() {
     for (let x=0;x<cols;x++){ maze[0][x]=1; maze[rows-1][x]=1; }
     for (let y=0;y<rows;y++){ maze[y][0]=1; maze[y][cols-1]=1; }
 
-    braidMaze(maze, BRAID_PROB);
-    punchExtraHoles(maze, EXTRA_HOLES);
+    // add loops but controlled
+    braidMaze(maze, mode.braid);
+    punchExtraHoles(maze, mode.holes);
 
-    // Pick an exit cell (near bottom-right but must be open)
+    // Pick exit
     exitCell = findOpenNear(cols-2, rows-2);
 
-    // Force corridor (Exit + 3 gates + tail) and SEAL it
-    const forced = forceSealedExitCorridor(exitCell);
+    // Force + seal corridor based on gate count (keys count)
+    const forced = forceSealedExitCorridor(exitCell, mode.keys);
     if (!forced) continue;
 
-    // gates must be exactly the 3 corridor cells in front of exit
+    corridorCells = forced.corridorCells;
     gates = forced.gates.map((c,i)=>({x:c.x,y:c.y,id:i+1,open:false}));
 
-    // Place player at a junction far from exit corridor
-    const startCell = pickStartJunctionFarFromExit(forced.corridorCells);
+    // Player start far from corridor & at junction
+    const startCell = pickStartJunctionFarFromExit(corridorCells);
     if (!startCell) continue;
 
-    // Place keys far from exit + far from start + not on corridor/gates
-    keys = placeMultipleKeys(startCell, exitCell, gates, KEY_COUNT, forced.corridorCells);
+    // Keys
+    keys = placeMultipleKeys(startCell, exitCell, gates, mode.keys, corridorCells);
     if (!keys) continue;
 
-    // Spawn multiple monsters far from player and far from exit corridor
-    const monsterCells = spawnMultipleMonstersFair(startCell, forced.corridorCells, MONSTER_COUNT);
+    // Monsters
+    const monsterCells = spawnMultipleMonstersFair(startCell, corridorCells, mode.monsters);
     if (!monsterCells) continue;
 
     // Commit entities
     player = {
-      r: cellSize*0.23,   // ✅你的旧碰撞手感
+      r: cellSize*0.30,
       x: (startCell.x+0.5)*cellSize,
       y: (startCell.y+0.5)*cellSize,
-      speed: 3.1
+      speed: (modeKey==="EASY") ? 3.25 : 3.10
     };
 
     monsters = monsterCells.map((mc, i) => ({
       r: cellSize*0.29,
       x: (mc.x+0.5)*cellSize,
       y: (mc.y+0.5)*cellSize,
-      speed: 1.65 + i*0.12, // slight variation
+      speed: mode.mSpeedBase + i*0.12,
       path: [],
       cooldown: floor(random(0, 10))
     }));
@@ -142,27 +151,20 @@ function resetGame() {
   }
 
   if (!ok) {
-    // fallback (rare)
+    // fallback
     const startCell = {x:1,y:1};
     player = { r: cellSize*0.30, x:(startCell.x+0.5)*cellSize, y:(startCell.y+0.5)*cellSize, speed:3.1 };
     exitCell = {x:cols-2,y:rows-2};
-    gates = [{x:cols-3,y:rows-2,id:1,open:false},{x:cols-4,y:rows-2,id:2,open:false},{x:cols-5,y:rows-2,id:3,open:false}];
-    keys = [{x:3,y:3,id:1,collected:false},{x:7,y:7,id:2,collected:false},{x:5,y:9,id:3,collected:false}];
-    monsters = [
-      { r: cellSize*0.29, x:(cols-2+0.5)*cellSize, y:(1+0.5)*cellSize, speed:1.65, path:[], cooldown:0 },
-      { r: cellSize*0.29, x:(cols-2+0.5)*cellSize, y:(3+0.5)*cellSize, speed:1.77, path:[], cooldown:0 },
-      { r: cellSize*0.29, x:(cols-2+0.5)*cellSize, y:(5+0.5)*cellSize, speed:1.89, path:[], cooldown:0 },
-    ];
+    gates = [{x:cols-3,y:rows-2,id:1,open:false}];
+    keys = [{x:3,y:3,id:1,collected:false}];
+    monsters = [{ r: cellSize*0.29, x:(cols-2+0.5)*cellSize, y:(1+0.5)*cellSize, speed:1.6, path:[], cooldown:0 }];
+    corridorCells = [exitCell, {x:cols-3,y:rows-2}, {x:cols-4,y:rows-2}];
   }
 
   keysCollected = 0;
   for (const k of keys) k.collected = false;
   for (const g of gates) g.open = false;
-
-  for (const m of monsters){
-    m.path = [];
-    m.cooldown = 0;
-  }
+  for (const m of monsters){ m.path=[]; m.cooldown=0; }
 
   timeLeft = timeLimitSec;
   score = scoreStart;
@@ -208,13 +210,14 @@ function drawUI(){
   fill(240);
   textSize(16);
   textAlign(LEFT,CENTER);
-  text(`Time: ${nf(max(0,floor(timeLeft)),3)}s`, 14, uiY);
-  text(`Score: ${score}`, 160, uiY);
-  text(`Keys: ${keysCollected}/${KEY_COUNT}`, 290, uiY);
+  text(`${mode.name}`, 14, uiY);
+  text(`Time: ${nf(max(0,floor(timeLeft)),3)}s`, 110, uiY);
+  text(`Score: ${score}`, 250, uiY);
+  text(`Keys: ${keysCollected}/${mode.keys}`, 370, uiY);
 
   textSize(12);
   fill(255,255,255,210);
-  text("Exit corridor is SEALED: no side bypass after keys open.", 14, uiY+26);
+  text("Sealed Exit Corridor (no bypass). 1/2/3 select mode.", 14, uiY+26);
 
   textAlign(RIGHT,CENTER);
   textSize(14);
@@ -230,12 +233,13 @@ function drawStartScreen(){
   fill(255);
   textAlign(CENTER,CENTER);
   textSize(24);
-  text("MAZE QUEST - SEALED EXIT CORRIDOR", width/2, height/2-70);
+  text("MAZE QUEST", width/2, height/2-86);
 
   textSize(14);
-  text("3 monsters chase immediately. If ANY catches you: LOSE.", width/2, height/2-30);
-  text("Collect 3 keys to break 3 light walls blocking the exit.", width/2, height/2-10);
-  text("Press SPACE to start.", width/2, height/2+45);
+  text(`Mode: ${mode.name}`, width/2, height/2-54);
+  text(`Monsters: ${mode.monsters}   Keys: ${mode.keys}`, width/2, height/2-32);
+  text("Press 1=Easy  2=Medium  3=Hard", width/2, height/2-6);
+  text("Press SPACE to start.", width/2, height/2+30);
 }
 
 function drawFinishScreen(isWin){
@@ -252,7 +256,7 @@ function drawFinishScreen(isWin){
   text(`Final Score: ${score}`, width/2, height/2-18);
 
   textSize(13);
-  text("Press R to restart.", width/2, height/2+35);
+  text("Press R to restart. (Or 1/2/3 to change mode)", width/2, height/2+35);
 }
 
 /* ================= Draw ================= */
@@ -351,7 +355,6 @@ function drawMonsters(){
     else fill(160,255,140);
 
     circle(m.x,m.y,m.r*2);
-
     fill(30);
     circle(m.x-m.r*0.25, m.y-m.r*0.1, m.r*0.25);
     circle(m.x+m.r*0.25, m.y-m.r*0.1, m.r*0.25);
@@ -361,6 +364,12 @@ function drawMonsters(){
 /* ================= Input ================= */
 function keyPressed(){
   if (key==='r' || key==='R'){ resetGame(); return; }
+
+  // mode selection at start/finish is allowed
+  if (key==='1'){ applyMode("EASY"); return; }
+  if (key==='2'){ applyMode("MEDIUM"); return; }
+  if (key==='3'){ applyMode("HARD"); return; }
+
   if (state==="START" && keyCode===32){ state="PLAY"; startTimeMs=millis(); }
 }
 
@@ -378,16 +387,15 @@ function handleMovement(){
   let dx=0, dy=0;
   const sp=player.speed;
 
-  if (keyIsDown(LEFT_ARROW) || keyIsDown(65)) dx -= sp;   // A
-  if (keyIsDown(RIGHT_ARROW) || keyIsDown(68)) dx += sp;  // D
-  if (keyIsDown(UP_ARROW) || keyIsDown(87)) dy -= sp;     // W
-  if (keyIsDown(DOWN_ARROW) || keyIsDown(83)) dy += sp;   // S
+  if (keyIsDown(LEFT_ARROW) || keyIsDown(65)) dx -= sp;
+  if (keyIsDown(RIGHT_ARROW) || keyIsDown(68)) dx += sp;
+  if (keyIsDown(UP_ARROW) || keyIsDown(87)) dy -= sp;
+  if (keyIsDown(DOWN_ARROW) || keyIsDown(83)) dy += sp;
 
   if (dx || dy){
     const mag=Math.hypot(dx,dy);
     dx = dx/mag*sp;
     dy = dy/mag*sp;
-
     tryMove(player, dx, dy);
   }
 }
@@ -586,7 +594,7 @@ function bfsPathNoGates(start, goal){
   return path;
 }
 
-/* ================= Start fairness helpers ================= */
+/* ================= Fairness helpers ================= */
 function degree(cell){
   const dirs=[[1,0],[-1,0],[0,1],[0,-1]];
   let c=0;
@@ -633,12 +641,6 @@ function branchLengthFrom(junction, stepCell){
   return maxD;
 }
 
-function corridorSet(cells){
-  const s = new Set();
-  for (const c of cells) s.add(`${c.x},${c.y}`);
-  return s;
-}
-
 function minDistToCorridor(cell, corrCells){
   let best = 9999;
   for (const c of corrCells){
@@ -657,7 +659,8 @@ function pickStartJunctionFarFromExit(corrCells){
       if (degree(c) < 3) continue;
 
       const dCorr = minDistToCorridor(c, corrCells);
-      if (dCorr !== -1 && dCorr >= MIN_PLAYER_DIST_FROM_EXIT) candidates.push(c);
+      const need = (modeKey==="EASY") ? 12 : MIN_PLAYER_DIST_FROM_EXIT;
+      if (dCorr !== -1 && dCorr >= need) candidates.push(c);
     }
   }
   if (!candidates.length) return null;
@@ -674,7 +677,8 @@ function spawnMultipleMonstersFair(startJ, corrCells, count){
       if(dPlayer < MIN_MONSTER_DIST) continue;
 
       const dCorr = minDistToCorridor({x,y}, corrCells);
-      if(dCorr === -1 || dCorr < MIN_MONSTER_DIST_FROM_EXIT) continue;
+      const needCorr = (modeKey==="EASY") ? 12 : MIN_MONSTER_DIST_FROM_EXIT;
+      if(dCorr === -1 || dCorr < needCorr) continue;
 
       candidates.push({x,y});
     }
@@ -685,9 +689,9 @@ function spawnMultipleMonstersFair(startJ, corrCells, count){
   if (exits.length < 3) return null;
 
   const picked = [];
-  const MIN_BETWEEN_MONSTERS = 10;
+  const MIN_BETWEEN_MONSTERS = (modeKey==="HARD") ? 9 : 10;
 
-  for (let tries=0; tries<1400; tries++){
+  for (let tries=0; tries<1600; tries++){
     const m = random(candidates);
 
     // apart
@@ -718,9 +722,13 @@ function spawnMultipleMonstersFair(startJ, corrCells, count){
   return null;
 }
 
-/* ================= Exit corridor (SEALED) ================= */
-function forceSealedExitCorridor(exitC){
-  // corridor extends from Exit outward: Exit -> G1 -> G2 -> G3 -> Tail
+/* ================= Sealed Exit Corridor =================
+   If gateCount=1:
+     [Exit][G1][Tail]
+   If gateCount=3:
+     [Exit][G1][G2][G3][Tail]
+======================================================== */
+function forceSealedExitCorridor(exitC, gateCount){
   const dirs = [
     {dx:-1,dy:0},
     {dx:1,dy:0},
@@ -728,7 +736,7 @@ function forceSealedExitCorridor(exitC){
     {dx:0,dy:1},
   ];
 
-  // prefer direction already open (less destructive)
+  // prefer already open neighbor
   dirs.sort((a,b)=>{
     const na = (maze[exitC.y+a.dy]?.[exitC.x+a.dx]===0) ? 0 : 1;
     const nb = (maze[exitC.y+b.dy]?.[exitC.x+b.dx]===0) ? 0 : 1;
@@ -739,48 +747,52 @@ function forceSealedExitCorridor(exitC){
     const g1 = {x: exitC.x + d.dx*1, y: exitC.y + d.dy*1};
     const g2 = {x: exitC.x + d.dx*2, y: exitC.y + d.dy*2};
     const g3 = {x: exitC.x + d.dx*3, y: exitC.y + d.dy*3};
-    const tail = {x: exitC.x + d.dx*4, y: exitC.y + d.dy*4};
+    const tail = {x: exitC.x + d.dx*(gateCount+1), y: exitC.y + d.dy*(gateCount+1)};
 
-    if (!inInnerBounds(g1) || !inInnerBounds(g2) || !inInnerBounds(g3) || !inInnerBounds(tail)) continue;
+    if (!inInnerBounds(g1) || !inInnerBounds(tail)) continue;
+    if (gateCount===3 && (!inInnerBounds(g2) || !inInnerBounds(g3))) continue;
 
-    // carve corridor cells open
+    // carve corridor cells
     maze[exitC.y][exitC.x]=0;
     maze[g1.y][g1.x]=0;
-    maze[g2.y][g2.x]=0;
-    maze[g3.y][g3.x]=0;
+    if (gateCount===3){
+      maze[g2.y][g2.x]=0;
+      maze[g3.y][g3.x]=0;
+    }
     maze[tail.y][tail.x]=0;
 
-    // ensure tail connects to rest of maze via forward direction only
-    ensureConnectedForwardOnly(tail, g3, d);
+    // connect forward from tail only
+    ensureConnectedForwardOnly(tail, (gateCount===3?g3:g1), d);
 
-    // HARD SEAL: close side neighbors for each corridor cell
-    const corridorCells = [exitC, g1, g2, g3, tail];
-    sealCorridorSides(corridorCells, d);
+    // list corridor cells
+    const corr = [exitC, g1];
+    const gateCells = [g1];
+    if (gateCount===3){ corr.push(g2,g3); gateCells.push(g2,g3); }
+    corr.push(tail);
 
-    // Exit has ONLY one neighbor: g1 (we already sealed sides; additionally enforce)
+    // seal sides strongly
+    sealCorridorSides(corr, d);
+
+    // exit only connects to g1
     enforceSingleExitNeighbor(exitC, g1);
 
-    return { gates: [g1,g2,g3], corridorCells };
+    return { gates: gateCells, corridorCells: corr };
   }
   return null;
 }
 
 function sealCorridorSides(cells, dir){
-  // forward/back are allowed: +/- dir
-  // side directions are the perpendiculars; must be WALL.
   const side1 = {dx: dir.dy, dy: -dir.dx};
   const side2 = {dx: -dir.dy, dy: dir.dx};
 
   for (const c of cells){
     const s1 = {x:c.x+side1.dx, y:c.y+side1.dy};
     const s2 = {x:c.x+side2.dx, y:c.y+side2.dy};
-
     if (inInnerBounds(s1)) maze[s1.y][s1.x] = 1;
     if (inInnerBounds(s2)) maze[s2.y][s2.x] = 1;
   }
 
-  // Also prevent "diagonal leak" around corridor corners:
-  // block diagonals adjacent to corridor sides (tight seal).
+  // block diagonal leaks near sides
   for (const c of cells){
     const d1 = {x:c.x+side1.dx+dir.dx, y:c.y+side1.dy+dir.dy};
     const d2 = {x:c.x+side1.dx-dir.dx, y:c.y+side1.dy-dir.dy};
@@ -793,10 +805,8 @@ function sealCorridorSides(cells, dir){
     if (inInnerBounds(d4)) maze[d4.y][d4.x] = 1;
   }
 
-  // Keep corridor cells open (in case above over-wrote)
-  for (const c of cells){
-    maze[c.y][c.x] = 0;
-  }
+  // re-open corridor cells
+  for (const c of cells) maze[c.y][c.x] = 0;
 }
 
 function enforceSingleExitNeighbor(exitC, gate1){
@@ -812,13 +822,10 @@ function enforceSingleExitNeighbor(exitC, gate1){
 }
 
 function ensureConnectedForwardOnly(tail, backCell, dir){
-  // We only allow connection forward from tail (same direction as corridor)
   const forward = {x: tail.x + dir.dx, y: tail.y + dir.dy};
   if (inInnerBounds(forward)){
-    // open forward cell so the rest of maze can connect there
     maze[forward.y][forward.x] = 0;
   } else {
-    // if forward is out, open a random neighbor (fallback)
     ensureConnected(tail, backCell);
   }
 }
@@ -838,7 +845,7 @@ function ensureConnected(cell, backCell){
   }
   const options = nbs.filter(nb=>inInnerBounds(nb) && !(nb.x===backCell.x && nb.y===backCell.y));
   if (options.length){
-    const pick = random(options);
+    const pick=random(options);
     maze[pick.y][pick.x]=0;
   }
 }
@@ -858,13 +865,18 @@ function placeMultipleKeys(playerCell, exitCell, gates, count, corridorCells){
 
       const de=abs(x-exitCell.x)+abs(y-exitCell.y);
       const dp=abs(x-playerCell.x)+abs(y-playerCell.y);
-      if (de>=KEY_SAFE_DIST_EXIT && dp>=KEY_SAFE_DIST_PLAYER) candidates.push({x,y});
+
+      // Easy map smaller, relax a bit
+      const needExit = (modeKey==="EASY") ? 7 : KEY_SAFE_DIST_EXIT;
+      const needPlr  = (modeKey==="EASY") ? 6 : KEY_SAFE_DIST_PLAYER;
+
+      if (de>=needExit && dp>=needPlr) candidates.push({x,y});
     }
   }
   if (candidates.length < count) return null;
 
   const chosen=[];
-  for (let tries=0; tries<1400 && chosen.length<count; tries++){
+  for (let tries=0; tries<1600 && chosen.length<count; tries++){
     const c=random(candidates);
     let ok=true;
     for (const s of chosen){
@@ -891,7 +903,7 @@ function findOpenNear(tx,ty){
   return {x:tx,y:ty};
 }
 
-/* ================= Maze generation: Randomized Prim ================= */
+/* ================= Maze generation: Prim + controlled loops ================= */
 function generateMazePrim(w,h){
   const g=Array.from({length:h},()=>Array(w).fill(1));
   function inBounds(x,y){ return x>0&&y>0&&x<w-1&&y<h-1; }
@@ -945,6 +957,7 @@ function braidMaze(g, prob){
   }
 }
 
+// Anti-room hole punching: avoid 2x2 open areas + avoid clustering + only "door walls"
 function punchExtraHoles(g, count){
   let tries = 0;
   const punched = new Set();
@@ -955,7 +968,7 @@ function punchExtraHoles(g, count){
     const y = floor(random(2, rows-2));
     if(g[y][x] !== 1) continue;
 
-    // 不允许扎堆：附近 1 格内如果有刚打过洞就跳过
+    // no clustering
     let near = false;
     for(let dy=-1; dy<=1; dy++){
       for(let dx=-1; dx<=1; dx++){
@@ -966,7 +979,7 @@ function punchExtraHoles(g, count){
     }
     if(near) continue;
 
-    // 只允许“墙两侧是路”的墙（像开一扇门），避免挖成大空地
+    // only "door" walls (connect two corridors), avoid room carving
     const left  = g[y][x-1]===0;
     const right = g[y][x+1]===0;
     const up    = g[y-1][x]===0;
@@ -975,7 +988,7 @@ function punchExtraHoles(g, count){
     const isDoor = (left && right && !up && !down) || (up && down && !left && !right);
     if(!isDoor) continue;
 
-    // 禁止产生 2x2 全空（房间感来源）
+    // anti 2x2 open square
     if(wouldCreate2x2Open(g, x, y)) continue;
 
     g[y][x] = 0;
@@ -985,7 +998,6 @@ function punchExtraHoles(g, count){
 }
 
 function wouldCreate2x2Open(g, x, y){
-  // 检查以 (x,y) 为角的四个 2x2 方块，只要会变成全 0 就拒绝
   const squares = [
     [[x,y],[x+1,y],[x,y+1],[x+1,y+1]],
     [[x,y],[x-1,y],[x,y+1],[x-1,y+1]],
@@ -997,7 +1009,6 @@ function wouldCreate2x2Open(g, x, y){
     let openCount = 0;
     for(const [sx,sy] of sq){
       if(sx<1||sy<1||sx>cols-2||sy>rows-2) { openCount = 0; break; }
-      // 注意：我们假设 (x,y) 会被打成 0
       const val = (sx===x && sy===y) ? 0 : g[sy][sx];
       if(val===0) openCount++;
     }
@@ -1005,7 +1016,6 @@ function wouldCreate2x2Open(g, x, y){
   }
   return false;
 }
-
 </script>
 </body>
 </html>
